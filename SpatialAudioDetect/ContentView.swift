@@ -13,15 +13,17 @@ extension SoundKind {
     }
 }
 
+/// Runner azimuth (0 = ahead, +90 = left) after the user's fine-tune → on-screen angle (0 = up, +90 = left).
+func calibrated(_ azimuth: Double, offset: Double, mirror: Bool) -> Double { (mirror ? -azimuth : azimuth) + offset }
+
 struct ContentView: View {
     @State private var radar = SoundRadar()
-    @State private var calibrating = false
-    // Calibration: which way the mic's "front" points depends on how the phone is held.
+    @State private var debugging = false
+    // Fine-tune, in case the phone's axes differ from what the app assumes.
     @AppStorage("rotate") private var offset = 0.0
     @AppStorage("mirror") private var mirror = false
 
-    /// Mic azimuth (0 = front, +90 = left) → on-screen angle (0 = up/ahead, +90 = left).
-    private func screenAngle(_ azimuth: Double) -> Double { (mirror ? -azimuth : azimuth) + offset }
+    private func screenAngle(_ azimuth: Double) -> Double { calibrated(azimuth, offset: offset, mirror: mirror) }
 
     private func whereIs(_ azimuth: Double?) -> String {
         guard let azimuth else { return "around you" }
@@ -42,9 +44,9 @@ struct ContentView: View {
             .navigationTitle("Sound Radar")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                Button("Calibrate", systemImage: "slider.horizontal.3") { calibrating = true }
+                Button("Debug", systemImage: "ladybug") { debugging = true }
             }
-            .sheet(isPresented: $calibrating) { calibration }
+            .sheet(isPresented: $debugging) { DebugView(radar: radar, offset: $offset, mirror: $mirror) }
         }
         .sensoryFeedback(.warning, trigger: radar.alertPulse)
         .animation(.easeOut(duration: 0.2), value: radar.alert)
@@ -139,62 +141,6 @@ struct ContentView: View {
         }
         .padding()
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))
-    }
-
-    // MARK: Calibration sheet
-
-    private var calibration: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    let loudest = radar.mics.max() ?? 0
-                    Grid(alignment: .leading, verticalSpacing: 12) {
-                        ForEach(phoneSides.indices, id: \.self) { i in
-                            GridRow {
-                                Label(phoneSides[i].name, systemImage: phoneSides[i].icon)
-                                // relative to the loudest side, 24 dB range, so the winner is obvious at a glance
-                                ProgressView(value: radar.last == nil ? 0 : min(max(1 + (radar.mics[i] - loudest) / 24, 0), 1))
-                                    .tint(radar.mics[i] == loudest ? Color.accentColor : .secondary)
-                            }
-                        }
-                    }
-                } header: {
-                    Text("Which side of the phone hears it")
-                } footer: {
-                    Text("Live. Snap your fingers close to each side of the phone: that side's bar should win. If a different bar wins, the phone's axes are mapped differently than assumed.")
-                }
-                Section {
-                    LabeledContent("Rotate", value: "\(Int(offset))°")
-                    Slider(value: $offset, in: -180...180, step: 5)
-                    Toggle("Mirror left/right", isOn: $mirror)
-                } header: {
-                    Text("Fine-tune")
-                } footer: {
-                    Text("Directions follow the phone's motion sensors, so upright, tilted or flat all work. Only adjust these if a clap in front of you still doesn't point to Ahead.")
-                }
-                Section {
-                    LabeledContent("Heard", value: radar.label.isEmpty ? "–" : radar.label)
-                    LabeledContent("Horn / siren score") {
-                        Text(radar.alertScore, format: .number.precision(.fractionLength(2)))
-                            .foregroundStyle(radar.alertScore >= alertThreshold ? .red : .secondary)
-                            .monospacedDigit()
-                    }
-                    if let r = radar.last {
-                        LabeledContent("Direction", value: radar.azimuth.map { "\(Int(screenAngle($0).rounded()))°" } ?? "–")
-                        LabeledContent("Level", value: "\(Int(r.db.rounded())) dBFS")
-                        LabeledContent("Directness", value: r.directness.formatted(.number.precision(.fractionLength(2))))
-                    }
-                } header: {
-                    Text("Live readout")
-                } footer: {
-                    Text("Horns, sirens, bike bells and shouts trigger Watch out at a score of \(alertThreshold, format: .number.precision(.fractionLength(2))) or higher.")
-                }
-            }
-            .navigationTitle("Calibrate")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { Button("Done") { calibrating = false } }
-        }
-        .presentationDetents([.medium, .large])
     }
 }
 

@@ -109,6 +109,26 @@ nonisolated struct ApproachDetector {
     private var history: [[Double]] = []
     private var sinceTick = 0.0
 
+    struct SectorStat {
+        var db: Double           // now
+        var rise: Double         // now minus `window` seconds ago
+        var biggestJump: Double  // largest rise between two ticks
+        var approaching: Bool
+    }
+
+    /// Per-sector view of the last `window` seconds; empty until the window has filled.
+    func stats() -> [SectorStat] {
+        let n = Int(window / tick) + 1
+        guard history.count == n else { return [] }
+        return (0..<Self.sectors).map { i in
+            let l = history.map { $0[i] }
+            let rise = l[n - 1] - l[0]
+            let jump = zip(l, l.dropFirst()).map { $1 - $0 }.max() ?? 0
+            return SectorStat(db: l[n - 1], rise: rise, biggestJump: jump,
+                              approaching: l[n - 1] > minDB && rise >= riseDB && jump <= rise / 2)
+        }
+    }
+
     /// Feed one direct-sound power reading; returns the sector that has been steadily getting louder.
     mutating func update(azimuth: Double, power p: Double, dt: Double) -> Int? {
         let s = slot(azimuth, of: Self.sectors), a = min(dt / 0.3, 1)
@@ -117,15 +137,9 @@ nonisolated struct ApproachDetector {
         guard sinceTick >= tick else { return nil }
         sinceTick -= tick
         history.append(power.map { 10 * log10(max($0, 1e-12)) })
-        let n = Int(window / tick) + 1
-        if history.count > n { history.removeFirst() }
-        guard history.count == n else { return nil }
-        return (0..<Self.sectors).filter { i in
-            let l = history.map { $0[i] }
-            let rise = l[n - 1] - l[0]
-            let biggestJump = zip(l, l.dropFirst()).map { $1 - $0 }.max() ?? 0
-            return l[n - 1] > minDB && rise >= riseDB && biggestJump <= rise / 2
-        }.max { history[n - 1][$0] < history[n - 1][$1] }
+        if history.count > Int(window / tick) + 1 { history.removeFirst() }
+        let st = stats()
+        return st.indices.filter { st[$0].approaching }.max { st[$0].db < st[$1].db }
     }
 }
 
@@ -174,20 +188,44 @@ nonisolated func selfCheck() {
     assert(classify(["person_running": 0.9, "breathing": 0.9]).kind == .other, "runner's own sounds ignored")
 }
 
+/// One audio block from the microphones, as delivered (~47 per second).
+nonisolated struct Block: Sendable {
+    var reading: Reading
+    var start: Double     // seconds since capture start (same clock as classifier verdicts)
+    var duration: Double
+    var format: String    // what iOS actually delivers, for the debug screen
+    var savingAudio: Bool // the raw audio of this block went into the recording
+}
+
 nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     let classifier = SoundClassifier()
-    /// (reading, block duration, block start in seconds since capture start)
-    var onReading: (@Sendable (Reading, TimeInterval, TimeInterval) -> Void)?
+    var onBlock: (@Sendable (Block) -> Void)?
     private var frames: AVAudioFramePosition = 0  // one clock shared by direction and classifier
+    private var recordURL: URL?
+    private var file: AVAudioFile?
+
+    /// Start (url) or stop (nil) saving the raw 4-channel audio. Call on the capture queue.
+    func record(to url: URL?) {
+        recordURL = url
+        file = nil  // releasing the file finalizes it
+    }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let desc = sampleBuffer.formatDescription, let format = AVAudioFormat(formatDescription: desc),
               format.channelCount >= 4 else { return }
         try? sampleBuffer.withAudioBufferList { abl, _ in
             guard let buf = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: abl.unsafePointer) else { return }
+            if let recordURL, file == nil {
+                file = try? AVAudioFile(forWriting: recordURL, settings: format.settings,
+                                        commonFormat: format.commonFormat, interleaved: format.isInterleaved)
+            }
+            let saved = (try? file?.write(from: buf)) != nil
             let ch = (0..<4).map { samples(buf, channel: $0) }
-            onReading?(foaReading(w: ch[0], y: ch[1], z: ch[2], x: ch[3]),
-                       Double(buf.frameLength) / format.sampleRate, Double(frames) / format.sampleRate)
+            let kind = format.commonFormat == .pcmFormatFloat32 ? "float32" : format.commonFormat == .pcmFormatInt16 ? "int16" : "other"
+            onBlock?(Block(reading: foaReading(w: ch[0], y: ch[1], z: ch[2], x: ch[3]),
+                           start: Double(frames) / format.sampleRate, duration: Double(buf.frameLength) / format.sampleRate,
+                           format: "\(Int(format.sampleRate)) Hz · \(format.channelCount) ch · \(kind)\(format.isInterleaved ? " interleaved" : "") · \(buf.frameLength) frames",
+                           savingAudio: saved))
             classifier.feed(ch[0], sampleRate: format.sampleRate, at: frames)
             frames += AVAudioFramePosition(buf.frameLength)
         }
@@ -214,17 +252,32 @@ struct Alert: Equatable {
     var what: String
 }
 
+/// Everything the debug screen shows about the latest audio block, refreshed 10×/s so numbers stay readable.
+struct DebugSnapshot {
+    var block: Block
+    var gravity: SIMD3<Double>
+    var azimuth: Double?  // runner-relative, before fine-tune; nil when the pose has no "ahead"
+    var loudness: Double  // 0…1 from the dB window
+    var strength: Double  // loudness × directness = radar line length
+    var mics: [Double]    // dB per phone side, lightly smoothed
+    var sectors: [ApproachDetector.SectorStat]
+}
+
 @Observable final class SoundRadar {
     var bins = [Bin](repeating: Bin(), count: 72)  // 5° per spoke
     var kind = SoundKind.other
     var label = ""
-    var last: Reading?
-    var azimuth: Double?  // latest direction relative to the runner
-    var mics = [Double](repeating: -120, count: phoneSides.count)  // live dB per phone side, lightly smoothed
-    var alertScore = 0.0  // latest best horn/siren/bell/shout confidence
     var alert: Alert?
     var alertPulse = 0  // bumps to re-fire the haptic while danger lasts
     var problem: String?
+
+    // Debug screen
+    var debug: DebugSnapshot?
+    var heard: Heard?            // latest classifier verdict
+    var heardLatency = 0.0       // seconds between the judged audio ending and the verdict arriving
+    var events: [String] = []    // decisions log, newest first
+    private(set) var recorder: Recorder?
+    var recordedFiles: [URL] = []  // last finished recording, for sharing
 
     private let session = AVCaptureSession()
     private let tap = FOATap()
@@ -232,6 +285,9 @@ struct Alert: Equatable {
     private let motion = CMMotionManager()
     private var approach = ApproachDetector()
     private var recent: [DirectionSample] = []  // last few seconds, for the classifier's late verdicts
+    private var mics = [Double](repeating: -120, count: phoneSides.count)
+    @ObservationIgnored private var clock = 0.0  // stream seconds, end of the latest block
+    @ObservationIgnored private var nextDebug = 0.0
     private var alertUntil = Date.distantPast
     private var lastPulse = Date.distantPast
 
@@ -247,9 +303,9 @@ struct Alert: Equatable {
         }
         let output = AVCaptureAudioDataOutput()
         output.spatialAudioChannelLayoutTag = kAudioChannelLayoutTag_HOA_ACN_SN3D | 4
-        tap.onReading = { [weak self] r, dt, t in
+        tap.onBlock = { [weak self] b in
             guard let self else { return }
-            Task { @MainActor in self.add(r, dt: dt, at: t) }
+            Task { @MainActor in self.add(b) }
         }
         tap.classifier.onResult = { [weak self] heard in
             guard let self else { return }
@@ -267,6 +323,27 @@ struct Alert: Equatable {
         session.commitConfiguration()
         let session = session
         queue.async { session.startRunning() }
+        log("listening")
+    }
+
+    func toggleRecording() {
+        let tap = tap
+        if let r = recorder {
+            queue.async { tap.record(to: nil) }
+            r.close()
+            recordedFiles = r.files
+            recorder = nil
+            log("recording stopped: \(r.folder.lastPathComponent)")
+        } else {
+            do {
+                let r = try Recorder(startedAt: clock)
+                recorder = r
+                queue.async { tap.record(to: r.audio) }
+                log("recording started: \(r.folder.lastPathComponent)")
+            } catch {
+                log("recording failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Strongest recent direction, optionally only among spokes tagged with `kind`.
@@ -277,10 +354,12 @@ struct Alert: Equatable {
     }
 
     private func hear(_ h: Heard) {
+        heard = h
+        heardLatency = clock - h.end
+        recorder?.verdict(h, received: clock)
+        if h.kind != kind { log("classifier: \(h.kind)\(h.label.isEmpty ? "" : " (\(pretty(h.label)))")") }
         kind = h.kind
-        let name = h.label.replacingOccurrences(of: "_", with: " ")
-        label = name.prefix(1).uppercased() + name.dropFirst()
-        alertScore = h.alertScore
+        label = pretty(h.label)
         guard h.kind == .alert else { return }
         // The verdict lands ~0.5 s after the sound (a short honk is already over), so take the direction
         // from the exact slice of audio the classifier judged, and paint it on the radar in red.
@@ -296,41 +375,57 @@ struct Alert: Equatable {
         warn(Alert(azimuth: found?.azimuth, what: label), .now)
     }
 
-    private func add(_ r: Reading, dt: TimeInterval, at t: TimeInterval) {
-        last = r
+    private func add(_ b: Block) {
+        let r = b.reading, now = Date.now
+        clock = b.start + b.duration
         mics = zip(mics, phoneSides.map(r.micDB)).map { 0.8 * $0 + 0.2 * $1 }
-        let now = Date.now
-        if now > alertUntil { alert = nil }
+        if now > alertUntil, alert != nil { alert = nil; log("alert cleared") }
         for i in bins.indices { bins[i].strength *= 0.95 }
 
         // Re-derive "ahead" from gravity on every block, so turning or tilting the phone takes effect immediately.
         let g = motion.deviceMotion.map { SIMD3($0.gravity.x, $0.gravity.y, $0.gravity.z) } ?? SIMD3(0, -1, 0)
-        guard let az = runnerAzimuth(r.phoneVector, gravity: g) else { azimuth = nil; return }
-        azimuth = az
-
+        let az = runnerAzimuth(r.phoneVector, gravity: g)
         // ponytail: fixed -70…-10 dBFS window and per-buffer decay; make them sliders if the street needs it
-        let strength = min(max((r.db + 70) / 60, 0), 1) * r.directness
-        recent.append(DirectionSample(t: t, azimuth: az, power: r.ww * r.directness, strength: strength))
-        recent.removeAll { $0.t < t - 4 }
-        let center = slot(az, of: bins.count)
-        for (d, k) in [(0, 1.0), (-1, 0.5), (1, 0.5)] {
-            let j = (center + d + bins.count) % bins.count
-            if strength * k > bins[j].strength { bins[j] = Bin(strength: strength * k, kind: kind) }
+        let loudness = min(max((r.db + 70) / 60, 0), 1)
+        let strength = az == nil ? 0 : loudness * r.directness
+
+        if let az {
+            recent.append(DirectionSample(t: b.start, azimuth: az, power: r.ww * r.directness, strength: strength))
+            recent.removeAll { $0.t < b.start - 4 }
+            let center = slot(az, of: bins.count)
+            for (d, k) in [(0, 1.0), (-1, 0.5), (1, 0.5)] {
+                let j = (center + d + bins.count) % bins.count
+                if strength * k > bins[j].strength { bins[j] = Bin(strength: strength * k, kind: kind) }
+            }
+            // Horns and sirens are raised in hear(); here only "something is getting closer".
+            if let s = approach.update(azimuth: az, power: r.ww * r.directness, dt: b.duration), kind != .people, kind != .alert {
+                warn(Alert(azimuth: Double(s) * 360 / Double(ApproachDetector.sectors),
+                           what: kind == .traffic ? "Vehicle getting closer" : "Sound getting closer"), now)
+            }
         }
 
-        // Horns and sirens are raised in hear(); here only "something is getting closer".
-        if let s = approach.update(azimuth: az, power: r.ww * r.directness, dt: dt), kind != .people, kind != .alert {
-            warn(Alert(azimuth: Double(s) * 360 / Double(ApproachDetector.sectors),
-                       what: kind == .traffic ? "Vehicle getting closer" : "Sound getting closer"), now)
+        if clock >= nextDebug {
+            nextDebug = clock + 0.1
+            debug = DebugSnapshot(block: b, gravity: g, azimuth: az, loudness: loudness, strength: strength,
+                                  mics: mics, sectors: approach.stats())
         }
+        recorder?.block(b, gravity: g, azimuth: az, loudness: loudness, strength: strength, kind: kind, alert: alert)
     }
 
     private func warn(_ a: Alert, _ now: Date) {
+        if alert?.what != a.what { log("WATCH OUT: \(a.what) at \(a.azimuth.map { "\(Int($0.rounded()))°" } ?? "unknown direction")") }
         alert = a
         alertUntil = now + 3
         if now.timeIntervalSince(lastPulse) > 1.5 {
             alertPulse += 1
             lastPulse = now
         }
+    }
+
+    private func log(_ message: String) {
+        let line = String(format: "%.1fs  ", clock) + message
+        events.insert(line, at: 0)
+        if events.count > 80 { events.removeLast() }
+        recorder?.event(line)
     }
 }

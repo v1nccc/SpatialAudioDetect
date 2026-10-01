@@ -19,11 +19,12 @@ nonisolated let soundKinds: [String: SoundKind] = {
 
 /// Alerts win at a lower bar than the rest: a missed horn is worse than a false buzz.
 nonisolated let alertThreshold = 0.3
+nonisolated let categoryThreshold = 0.4  // traffic / people
 
 nonisolated func classify(_ scores: [String: Double]) -> (kind: SoundKind, label: String) {
     let hits = scores.compactMap { label, c in soundKinds[label].map { (kind: $0, label: label, c: c) } }
     if let a = hits.filter({ $0.kind == .alert && $0.c >= alertThreshold }).max(by: { $0.c < $1.c }) { return (.alert, a.label) }
-    if let b = hits.filter({ $0.kind != .alert && $0.c >= 0.4 }).max(by: { $0.c < $1.c }) { return (b.kind, b.label) }
+    if let b = hits.filter({ $0.kind != .alert && $0.c >= categoryThreshold }).max(by: { $0.c < $1.c }) { return (b.kind, b.label) }
     return (.other, "")
 }
 
@@ -33,6 +34,13 @@ nonisolated struct Heard: Sendable {
     var label: String
     var alertScore: Double  // best horn/siren/bell/shout confidence, for tuning on a real street
     var start: Double, end: Double
+    var top: [(id: String, confidence: Double)]  // Apple's raw top guesses, for the debug screen
+}
+
+/// "car_horn" -> "Car horn"
+nonisolated func pretty(_ id: String) -> String {
+    let s = id.replacingOccurrences(of: "_", with: " ")
+    return s.prefix(1).uppercased() + s.dropFirst()
 }
 
 /// Runs Apple's sound classifier on the omni channel; a verdict every 0.25 s.
@@ -66,6 +74,7 @@ nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecke
         let scores = Dictionary(r.classifications.map { ($0.identifier, $0.confidence) }, uniquingKeysWith: max)
         let (kind, label) = classify(scores)
         onResult?(Heard(kind: kind, label: label, alertScore: scores.filter { soundKinds[$0.key] == .alert }.values.max() ?? 0,
-                        start: r.timeRange.start.seconds, end: r.timeRange.end.seconds))
+                        start: r.timeRange.start.seconds, end: r.timeRange.end.seconds,
+                        top: r.classifications.prefix(6).map { ($0.identifier, $0.confidence) }))
     }
 }
