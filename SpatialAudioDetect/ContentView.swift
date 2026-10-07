@@ -13,30 +13,20 @@ extension SoundKind {
     }
 }
 
-/// Runner azimuth (0 = ahead, +90 = left) after the user's fine-tune → on-screen angle (0 = up, +90 = left).
-func calibrated(_ azimuth: Double, offset: Double, mirror: Bool) -> Double { (mirror ? -azimuth : azimuth) + offset }
-
 struct ContentView: View {
-    @State private var radar = SoundRadar()
+    @State private var radar = SoundRadar.shared
     @State private var debugging = false
+    @State private var tuningHaptics = false
     // Fine-tune, in case the phone's axes differ from what the app assumes.
     @AppStorage("rotate") private var offset = 0.0
     @AppStorage("mirror") private var mirror = false
-
-    private func screenAngle(_ azimuth: Double) -> Double { calibrated(azimuth, offset: offset, mirror: mirror) }
-
-    private func whereIs(_ azimuth: Double?) -> String {
-        guard let azimuth else { return "around you" }
-        let names = ["ahead", "ahead on your left", "on your left", "behind on your left",
-                     "behind you", "behind on your right", "on your right", "ahead on your right"]
-        return names[slot(screenAngle(azimuth), of: names.count)]
-    }
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
                 statusCard
                 radarCard
+                controls
                 Spacer(minLength: 0)
             }
             .padding()
@@ -44,15 +34,18 @@ struct ContentView: View {
             .navigationTitle("Sound Radar")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                Button("Haptics", systemImage: "hand.tap") { tuningHaptics = true }
                 Button("Debug", systemImage: "ladybug") { debugging = true }
             }
             .sheet(isPresented: $debugging) { DebugView(radar: radar, offset: $offset, mirror: $mirror) }
+            .sheet(isPresented: $tuningHaptics) { HapticsView(radar: radar) }
         }
-        .sensoryFeedback(.warning, trigger: radar.alertPulse)
+        .onChange(of: offset, initial: true) { radar.setCalibration(offset: offset, mirror: mirror) }
+        .onChange(of: mirror) { radar.setCalibration(offset: offset, mirror: mirror) }
         .animation(.easeOut(duration: 0.2), value: radar.alert)
         .task {
             UIApplication.shared.isIdleTimerDisabled = true  // keep the screen on while running
-            await radar.start()
+            radar.cleanUpIfIdle()
         }
     }
 
@@ -62,12 +55,18 @@ struct ContentView: View {
         let (icon, tint, title, detail): (String, Color, String, String) =
             if let problem = radar.problem {
                 ("mic.slash.fill", .secondary, "Not listening", problem)
+            } else if !radar.listeningStarted {
+                ("ear", .secondary, "Not listening", "Tap Start. The Dynamic Island shows while it listens.")
+            } else if radar.paused {
+                ("pause.circle.fill", .secondary, "Paused", "Not listening. Resume below or from the Dynamic Island.")
+            } else if let trouble = radar.micTrouble {
+                ("mic.slash.fill", .orange, "Not hearing anything", trouble)
             } else if let a = radar.alert {
-                (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", .red, "Watch out!", "\(a.what) \(whereIs(a.azimuth))")
+                (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", .red, "Watch out!", "\(a.what) \(directionWords(a.azimuth))")
             } else {
                 switch radar.kind {
-                case .traffic: ("car.fill", .orange, "Traffic nearby", "Normal traffic, mostly \(whereIs(radar.loudestAzimuth(of: .traffic)))")
-                case .people: ("person.2.fill", .blue, "People talking", "Mostly \(whereIs(radar.loudestAzimuth(of: .people)))")
+                case .traffic: ("car.fill", .orange, "Traffic nearby", "Normal traffic, mostly \(directionWords(radar.loudestAzimuth(of: .traffic)))")
+                case .people: ("person.2.fill", .blue, "People talking", "Mostly \(directionWords(radar.loudestAzimuth(of: .people)))")
                 default: ("checkmark.circle.fill", .green, "All clear", "Nothing to watch out for")
                 }
             }
@@ -75,7 +74,7 @@ struct ContentView: View {
             Image(systemName: icon)
                 .font(.system(size: 52, weight: .bold))
                 .foregroundStyle(tint)
-                .rotationEffect(.degrees(-(radar.alert?.azimuth.map(screenAngle) ?? 0)))  // arrow points at the danger
+                .rotationEffect(.degrees(-(radar.alert?.azimuth ?? 0)))  // arrow points at the danger
                 .frame(width: 64)
             VStack(alignment: .leading, spacing: 4) {
                 Text(title).font(.largeTitle.bold()).foregroundStyle(radar.alert == nil ? .primary : tint)
@@ -86,6 +85,30 @@ struct ContentView: View {
         .padding(20)
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))
         .accessibilityElement(children: .combine)
+    }
+
+    /// Start a session; then Pause / Resume, or Stop (mic off, Dynamic Island gone).
+    private var controls: some View {
+        HStack(spacing: 12) {
+            if radar.listeningStarted {
+                Button { radar.setPaused(!radar.paused) } label: {
+                    Label(radar.paused ? "Resume" : "Pause", systemImage: radar.paused ? "play.fill" : "pause.fill")
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .tint(radar.paused ? .green : .gray)
+                Button { radar.stop() } label: {
+                    Label("Stop", systemImage: "stop.fill").frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .tint(.red)
+            } else {
+                Button { Task { await radar.start() } } label: {
+                    Label("Start listening", systemImage: "play.fill").frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .tint(.green)
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .font(.title3.bold())
     }
 
     // MARK: Radar: you in the middle, ahead is up
@@ -106,14 +129,14 @@ struct ContentView: View {
                                    with: .color(.secondary.opacity(0.35)), lineWidth: 1.5)
                     }
                     if let az = radar.alert?.azimuth {
-                        let a = screenAngle(az), arc = Array(stride(from: -25.0, through: 25, by: 5))
+                        let a = az, arc = Array(stride(from: -25.0, through: 25, by: 5))
                         var wedge = Path()
                         wedge.addLines(arc.map { point(a + $0, r1) } + arc.reversed().map { point(a + $0, r0) })
                         wedge.closeSubpath()
                         ctx.fill(wedge, with: .color(.red.opacity(0.3)))
                     }
                     for (i, bin) in radar.bins.enumerated() where bin.strength > 0.01 {
-                        let a = screenAngle(Double(i) / Double(radar.bins.count) * 360)
+                        let a = Double(i) / Double(radar.bins.count) * 360
                         var p = Path()
                         p.move(to: point(a, r0 + 6))
                         p.addLine(to: point(a, r0 + 6 + (r1 - r0) * bin.strength))
@@ -150,4 +173,6 @@ struct ContentView: View {
 
 #Playground {
     selfCheck()
+    hapticsSelfCheck()
+    radarActivitySelfCheck()
 }

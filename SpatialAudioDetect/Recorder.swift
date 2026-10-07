@@ -7,10 +7,10 @@ import simd
 /// verdicts.csv every classifier verdict (4/s) with Apple's raw top labels
 /// events.txt   the decisions log
 final class Recorder {
-    static let blockColumns = ["t", "duration", "db", "directness", "azimuth", "loudness", "strength",
-                               "W_db", "X_db", "Y_db", "Z_db"]
+    static let blockColumns = ["t", "duration", "db", "directness", "raw_azimuth", "heading_correction", "azimuth",
+                               "hum_db", "usual_db", "loudness", "strength", "W_db", "X_db", "Y_db", "Z_db"]
         + phoneSides.map { $0.name.lowercased().replacingOccurrences(of: " ", with: "_") + "_db" }
-        + ["gx", "gy", "gz", "kind", "alert", "audio_saved"]
+        + ["gx", "gy", "gz", "yaw_rate", "kind", "alert", "audio_saved"]
 
     let folder: URL, audio: URL, startedAt: Double
     private let blocks: FileHandle, verdicts: FileHandle, events: FileHandle
@@ -40,15 +40,16 @@ final class Recorder {
             .filter { FileManager.default.fileExists(atPath: $0.path(percentEncoded: false)) }
     }
 
-    func block(_ b: Block, gravity g: SIMD3<Double>, azimuth: Double?, loudness: Double, strength: Double,
-               kind: SoundKind, alert: Alert?) {
-        let r = b.reading
+    func block(_ p: Processed, kind: SoundKind, alert: Alert?) {
+        let b = p.block, r = b.reading, g = p.motion.gravity
         func f(_ v: Double, _ digits: Int = 1) -> String { String(format: "%.\(digits)f", v) }
         func db(_ p: Double) -> String { f(10 * log10(max(p, 1e-12))) }
-        let cols = [f(b.start, 3), f(b.duration, 4), f(r.db), f(r.directness, 3), azimuth.map { f($0) } ?? "",
-                    f(loudness, 3), f(strength, 3), db(r.ww), db(r.xx), db(r.yy), db(r.zz)]
-            + phoneSides.map { f(r.micDB($0)) }
-            + [f(g.x, 3), f(g.y, 3), f(g.z, 3), "\(kind)", alert?.what ?? "", b.savingAudio ? "1" : "0"]
+        func opt(_ v: Double?) -> String { v.map { f($0) } ?? "" }
+        let signal: [String] = [f(b.start, 3), f(b.duration, 4), f(r.db), f(r.directness, 3), opt(p.rawAzimuth),
+                                f(p.correction), opt(p.azimuth), opt(p.hum), opt(p.usual), f(p.loudness, 3), f(p.strength, 3)]
+        let channels: [String] = [db(r.ww), db(r.xx), db(r.yy), db(r.zz)] + phoneSides.map { f(r.micDB($0)) }
+        let rest: [String] = [f(g.x, 3), f(g.y, 3), f(g.z, 3), f(p.motion.yawRate, 4), "\(kind)", alert?.what ?? "", b.savingAudio ? "1" : "0"]
+        let cols = signal + channels + rest
         assert(cols.count == Self.blockColumns.count, "blocks.csv row doesn't match its header")
         write(blocks, cols.joined(separator: ","))
     }

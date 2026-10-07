@@ -69,6 +69,9 @@ nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecke
         queue.async { analyzer.analyze(buf, atAudioFramePosition: at) }
     }
 
+    /// Process everything fed so far and deliver the last verdicts (replay tool).
+    func finish() { queue.sync { analyzer?.completeAnalysis() } }
+
     func request(_ request: SNRequest, didProduce result: SNResult) {
         guard let r = result as? SNClassificationResult else { return }
         let scores = Dictionary(r.classifications.map { ($0.identifier, $0.confidence) }, uniquingKeysWith: max)

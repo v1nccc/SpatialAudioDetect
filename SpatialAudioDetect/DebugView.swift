@@ -8,8 +8,6 @@ struct DebugView: View {
     @Binding var mirror: Bool
     @Environment(\.dismiss) private var dismiss
 
-    private let sectorNames = ["Ahead", "Ahead-left", "Left", "Behind-left", "Behind", "Behind-right", "Right", "Ahead-right"]
-
     var body: some View {
         NavigationStack {
             Form {
@@ -20,12 +18,12 @@ struct DebugView: View {
                     sideSection(d)
                     poseSection(d)
                     directionSection(d)
+                    classifierSection(d)
+                    approachSection(d)
+                    decisionSection(d)
                 } else {
                     Section { Text("Waiting for audio…").foregroundStyle(.secondary) }
                 }
-                classifierSection
-                if let d = radar.debug { approachSection(d) }
-                decisionSection
                 fineTuneSection
             }
             .navigationTitle("Debug")
@@ -41,7 +39,7 @@ struct DebugView: View {
         Section {
             Toggle(isOn: Binding(get: { radar.recorder != nil }, set: { _ in radar.toggleRecording() })) {
                 if let r = radar.recorder {
-                    let secs = radar.debug.map { Int($0.block.start + $0.block.duration - r.startedAt) } ?? 0
+                    let secs = radar.debug.map { Int($0.processed.block.start + $0.processed.block.duration - r.startedAt) } ?? 0
                     Label("Recording · \(secs) s", systemImage: "record.circle.fill").foregroundStyle(.red)
                 } else {
                     Label("Record session", systemImage: "record.circle")
@@ -61,21 +59,21 @@ struct DebugView: View {
 
     private func inputSection(_ d: DebugSnapshot) -> some View {
         Section("① Microphone input") {
-            Text(d.block.format).font(.callout.monospaced())
-            value("Block", "\(f(d.block.duration * 1000, 1)) ms · \(Int((1 / d.block.duration).rounded())) per second")
-            value("Stream time", "\(f(d.block.start, 1)) s")
+            Text(d.processed.block.format).font(.callout.monospaced())
+            value("Block", "\(f(d.processed.block.duration * 1000, 1)) ms · \(Int((1 / d.processed.block.duration).rounded())) per second")
+            value("Stream time", "\(f(d.processed.block.start, 1)) s")
         }
     }
 
     private func channelSection(_ d: DebugSnapshot) -> some View {
-        let r = d.block.reading
+        let r = d.processed.block.reading
         let rows = [("W · all", r.ww), ("X · front–back", r.xx), ("Y · left–right", r.yy), ("Z · up–down", r.zz)]
         return Section {
             meters(rows.map { ($0.0, (db($0.1) + 90) / 90, "\(Int(db($0.1).rounded())) dB", .accentColor) })
         } header: {
-            Text("② Raw ambisonic channels")
+            Text("② Ambisonic channels (after \(Int(BlockMaker.highPassHz)) Hz high-pass)")
         } footer: {
-            Text("iOS mixes the iPhone's mics into these 4; apps never see the individual mics. W is overall loudness. X, Y, Z only point somewhere when they rise and fall together with W, which is Directness in ⑤.")
+            Text("iOS mixes the iPhone's mics into these 4; apps never see the individual mics. Everything below \(Int(BlockMaker.highPassHz)) Hz (wind on the mics, engine rumble) is filtered out first. W is overall loudness. X, Y, Z only point somewhere when they rise and fall together with W, which is Directness in ⑤.")
         }
     }
 
@@ -94,50 +92,54 @@ struct DebugView: View {
     }
 
     private func poseSection(_ d: DebugSnapshot) -> some View {
-        let g = d.gravity
+        let g = d.processed.motion.gravity
         let pose = abs(g.z) > 0.8 ? "flat, screen \(g.z < 0 ? "up" : "down")"
             : g.y < -0.7 ? "upright" : g.y > 0.7 ? "upside down" : abs(g.x) > 0.7 ? "sideways" : "tilted"
         return Section {
             value("Holding", pose)
             value("Gravity x, y, z", "\(f(g.x)), \(f(g.y)), \(f(g.z))")
+            value("Turning (gyro)", "\(Int((d.processed.motion.yawRate * 180 / .pi).rounded()))°/s")
+            value("Arm-swing correction", "\(Int(d.processed.correction.rounded()))°")
         } header: {
             Text("④ Phone pose (motion sensors)")
         } footer: {
-            Text(d.azimuth == nil
+            Text(d.processed.azimuth == nil
                  ? "No usable \"ahead\" in this pose (camera and top edge point at sky or ground), so directions are paused."
-                 : "\"Ahead\" = where the camera and top edge point, flattened onto the ground. Recomputed every block.")
+                 : "\"Ahead\" = where the camera and top edge point, flattened onto the ground. The gyroscope then cancels arm swing: \"ahead\" follows your average heading over ~2 s, not every swing of the phone.")
         }
     }
 
     private func directionSection(_ d: DebugSnapshot) -> some View {
-        let r = d.block.reading
+        let r = d.processed.block.reading
         return Section {
+            let p = d.processed
             value("Level (W)", "\(f(r.db, 1)) dBFS")
+            value("Street hum · usual", p.hum.map { "\(f($0, 1)) · \(f(p.usual ?? $0, 1)) dBFS" } ?? "learning…")
             value("Directness", f(r.directness))
-            if let az = d.azimuth {
-                value("Direction", "\(Int(az.rounded()))° · \(sectorNames[slot(az, of: sectorNames.count)])")
-                value("After fine-tune", "\(Int(remainder(calibrated(az, offset: offset, mirror: mirror), 360).rounded()))°")
+            if let raw = p.rawAzimuth, let az = p.azimuth {
+                value("Direction from pose", "\(Int(raw.rounded()))°")
+                value("+ fine-tune + arm swing", "\(Int(az.rounded()))° · \(pretty(sectorNames[slot(az, of: sectorNames.count)]))")
             }
-            value("Radar line", "\(f(d.loudness)) loud × \(f(r.directness)) direct = \(f(d.strength))")
+            value("Radar line", "\(f((p.loudness * 24), 0)) dB over hum → \(f(p.loudness)) × \(f(r.directness)) = \(f(p.strength))")
         } header: {
             Text("⑤ Direction and radar line")
         } footer: {
-            Text("Loudness maps −70…−10 dBFS to 0…1. Directness: 0 = sound from everywhere (traffic hum, wind, echoes), 1 = one clear source. Busy traffic is loud; if it also reads high directness, that's why the radar fills up.")
+            Text("Hum = the quietest fifth of the last 30 s; usual = its median. A radar line shows how far a sound stands out above the hum (24 dB = full length) × how directional it is, so a steady roar draws nothing.")
         }
     }
 
     // MARK: ⑥ – ⑧ Decisions
 
-    private var classifierSection: some View {
+    private func classifierSection(_ d: DebugSnapshot) -> some View {
         Section {
-            if let h = radar.heard {
+            if let h = d.heard {
                 value("Verdict", h.label.isEmpty ? "\(h.kind)" : "\(h.kind) · \(pretty(h.label))")
                 LabeledContent("Horn/siren score") {
                     Text("\(f(h.alertScore)) (fires ≥ \(f(alertThreshold)))")
                         .monospacedDigit()
                         .foregroundStyle(h.alertScore >= alertThreshold ? .red : .secondary)
                 }
-                value("Judged audio", "\(f(h.start)) – \(f(h.end)) s · answer \(Int(radar.heardLatency * 1000)) ms later")
+                value("Judged audio", "\(f(h.start)) – \(f(h.end)) s · answer \(Int(d.heardLatency * 1000)) ms later")
                 meters(h.top.map { t in
                     (pretty(t.id), t.confidence, f(t.confidence), soundKinds[t.id]?.color ?? .secondary)
                 })
@@ -160,38 +162,39 @@ struct DebugView: View {
                 Grid(alignment: .trailing, horizontalSpacing: 14, verticalSpacing: 8) {
                     GridRow {
                         Text("Sector").gridColumnAlignment(.leading)
-                        Text("Now dB")
+                        Text("vs usual")
                         Text("Rise")
-                        Text("Jump")
+                        Text("Sweep")
                         Text("")
                     }
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
                     ForEach(d.sectors.indices, id: \.self) { i in
-                        let s = d.sectors[i]
+                        let s = d.sectors[i], over = d.processed.usual.map { s.db - $0 }
+                        let status = statusIcon(approaching: s.approaching, heldBack: d.heldBack[i])
                         GridRow {
-                            Text(sectorNames[i])
-                            Text("\(Int(s.db.rounded()))").foregroundStyle(s.db > rule.minDB ? .primary : .secondary)
+                            Text(pretty(sectorNames[i]))
+                            Text(over.map { String(format: "%+.0f", $0) } ?? "–")
+                                .foregroundStyle((over ?? 0) >= Detector.standOutDB ? .orange : .primary)
                             Text(f(s.rise, 1)).foregroundStyle(s.rise >= rule.riseDB ? .orange : .primary)
-                            Text(f(s.biggestJump, 1))
-                            Image(systemName: s.approaching ? "exclamationmark.triangle.fill" : "minus")
-                                .foregroundStyle(s.approaching ? .red : .secondary)
+                            Text("\(Int(s.sweep.rounded()))°").foregroundStyle(s.sweep > Detector.maxSweep ? .orange : .primary)
+                            Image(systemName: status.0).foregroundStyle(status.1)
                         }
                     }
                 }
                 .monospacedDigit()
             }
         } header: {
-            Text("⑦ Getting-closer detector (45° sectors)")
+            Text("⑦ Getting-closer detector (a beam per 45° sector)")
         } footer: {
-            Text("Fires when a sector ends above \(Int(rule.minDB)) dB, rose ≥ \(f(rule.riseDB, 0)) dB over \(f(rule.window, 0)) s, and no single 0.25 s jump was more than half the rise. Skipped while the classifier says people or an alert sound.")
+            Text("Getting closer = rose ≥ \(f(rule.riseDB, 0)) dB in \(f(rule.window, 0)) s without one big jump, and \(f(rule.leadDB, 0)) dB above the other directions. It only warns ⚠️ if it is also out of view (left, behind or right; 👁 otherwise), ≥ \(f(Detector.standOutDB, 0)) dB over this street's usual level (🔈 otherwise), stood out for 1 s (⏳), and its bearing moves ≤ \(f(Detector.maxSweep, 0))°/s; faster = passing by (↔). Not while the classifier says people or an alert sound.")
         }
     }
 
-    private var decisionSection: some View {
+    private func decisionSection(_ d: DebugSnapshot) -> some View {
         Section {
-            value("Now showing", radar.alert.map { "Watch out · \($0.what)" } ?? "\(radar.kind)")
-            ForEach(Array(radar.events.enumerated()), id: \.offset) { _, line in
+            value("Now showing", d.alert.map { "Watch out · \($0.what)" } ?? "\(d.kind)")
+            ForEach(Array(d.events.enumerated()), id: \.offset) { _, line in
                 Text(line).font(.caption.monospaced())
             }
         } header: {
@@ -212,6 +215,19 @@ struct DebugView: View {
     }
 
     // MARK: Helpers
+
+    /// ⑦'s last column: not approaching, warned, or why it was held back.
+    private func statusIcon(approaching: Bool, heldBack: String?) -> (String, Color) {
+        guard approaching else { return ("minus", .secondary) }
+        return switch heldBack {
+        case nil: ("exclamationmark.triangle.fill", .red)
+        case "view": ("eye", .secondary)
+        case "usual": ("speaker.wave.1", .secondary)
+        case "settling": ("hourglass", .secondary)
+        case "passing": ("arrow.left.and.right", .secondary)
+        default: ("waveform", .secondary)
+        }
+    }
 
     private func value(_ title: String, _ text: String) -> some View {
         LabeledContent(title) { Text(text).monospacedDigit() }
