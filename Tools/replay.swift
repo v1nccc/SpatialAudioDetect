@@ -18,16 +18,19 @@ final class Verdicts: @unchecked Sendable {
 
 /// Runs every block through the classifier and the Detector in the order they'd happen live, then prints a summary.
 func replay(_ name: String, next: () -> AVAudioPCMBuffer?, motion: (Double) -> Motion) {
-    var maker = BlockMaker()
-    let classifier = SoundClassifier(), verdicts = Verdicts()
-    classifier.onResult = { verdicts.add($0) }
+    var maker = BlockMaker(), steerer = Detector()  // steerer: aims the beams exactly as the live app would
+    let verdicts = Verdicts()
+    let omni = SoundClassifier(realTime: false), beams = beamAzimuths.indices.map { SoundClassifier(beam: $0, realTime: false) }
+    for c in [omni] + beams { c.onResult = { verdicts.add($0) } }
     var blocks: [Block] = []
     while let buf = next() {
-        let made = maker.make(buf)
+        let made = maker.make(buf, steering: steerer.beamWeights)
         blocks.append(made.block)
-        classifier.feed(made.omni, sampleRate: buf.format.sampleRate, at: made.at)
+        steerer.add(made.block, motion: motion(made.block.start))
+        omni.feed(made.omni, sampleRate: buf.format.sampleRate, at: made.at)
+        for (k, beam) in made.beams.enumerated() { beams[k].feed(beam, sampleRate: buf.format.sampleRate, at: made.at) }
     }
-    classifier.finish()
+    for c in [omni] + beams { c.finish() }
     let heard = verdicts.all.sorted { $0.end < $1.end }
 
     var d = Detector(), v = 0, lit = 0, log: [String] = []
@@ -35,7 +38,9 @@ func replay(_ name: String, next: () -> AVAudioPCMBuffer?, motion: (Double) -> M
     func step(_ change: (inout Detector) -> Void) {
         let before = d.alert
         change(&d)
-        if let a = d.alert, a.what != before?.what { onsets.append((d.clock, a.what, a.azimuth)) }
+        if let a = d.alert, a.what != before?.what || a.level != before?.level {
+            onsets.append((d.clock, "\(a.level == .critical ? "CRITICAL" : "warning") · \(a.what)", a.azimuth))
+        }
         log += d.pendingLog
         d.clearPendingLog()
     }
@@ -50,7 +55,7 @@ func replay(_ name: String, next: () -> AVAudioPCMBuffer?, motion: (Double) -> M
     }
 
     func at(_ az: Double?) -> String { az.map { "\(Int($0.rounded()))° \(sectorNames[slot($0, of: 8)])" } ?? "?" }
-    print("== \(name): \(String(format: "%.1f", d.clock)) s, \(blocks.count) blocks, \(heard.count) classifier verdicts")
+    print("== \(name): \(String(format: "%.1f", d.clock)) s, \(blocks.count) blocks, \(heard.count) classifier verdicts (all-around + 4 beams)")
     print(String(format: "Watch out: %d onsets, %.1f per minute", onsets.count, Double(onsets.count) / max(d.clock / 60, 1e-9)))
     for what in Set(onsets.map(\.what)).sorted() {
         let these = onsets.filter { $0.what == what }

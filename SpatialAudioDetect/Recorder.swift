@@ -28,7 +28,7 @@ final class Recorder {
             return h
         }
         blocks = try open("blocks.csv", Self.blockColumns.joined(separator: ",") + "\n")
-        verdicts = try open("verdicts.csv", "start,end,received,kind,label,alert_score,top_labels\n")
+        verdicts = try open("verdicts.csv", "start,end,received,kind,label,alert_score,top_labels,source\n")
         events = try open("events.txt", "")
         folder = dir
         audio = dir.appending(path: "audio.caf")
@@ -48,7 +48,7 @@ final class Recorder {
         let signal: [String] = [f(b.start, 3), f(b.duration, 4), f(r.db), f(r.directness, 3), opt(p.rawAzimuth),
                                 f(p.correction), opt(p.azimuth), opt(p.hum), opt(p.usual), f(p.loudness, 3), f(p.strength, 3)]
         let channels: [String] = [db(r.ww), db(r.xx), db(r.yy), db(r.zz)] + phoneSides.map { f(r.micDB($0)) }
-        let rest: [String] = [f(g.x, 3), f(g.y, 3), f(g.z, 3), f(p.motion.yawRate, 4), "\(kind)", alert?.what ?? "", b.savingAudio ? "1" : "0"]
+        let rest: [String] = [f(g.x, 3), f(g.y, 3), f(g.z, 3), f(p.motion.yawRate, 4), "\(kind)", alert.map { "\($0.level == .critical ? "critical" : "warning"): \($0.what)" } ?? "", b.savingAudio ? "1" : "0"]
         let cols = signal + channels + rest
         assert(cols.count == Self.blockColumns.count, "blocks.csv row doesn't match its header")
         write(blocks, cols.joined(separator: ","))
@@ -57,7 +57,8 @@ final class Recorder {
     func verdict(_ h: Heard, received: Double) {
         let top = h.top.map { "\($0.id):\(String(format: "%.2f", $0.confidence))" }.joined(separator: " ")
         write(verdicts, [String(format: "%.3f", h.start), String(format: "%.3f", h.end), String(format: "%.3f", received),
-                         "\(h.kind)", h.label, String(format: "%.3f", h.alertScore), top].joined(separator: ","))
+                         "\(h.kind)", h.label, String(format: "%.3f", h.alertScore), top,
+                         h.beam.map { beamNames[$0] } ?? "all-around"].joined(separator: ","))
     }
 
     func event(_ line: String) { write(events, line) }

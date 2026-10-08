@@ -1,12 +1,16 @@
 import SwiftUI
 
-/// Every stage of the pipeline, live and in processing order (① mics → ⑧ decision),
+/// Every stage of the pipeline, live and in processing order (① mics → ⑨ decision),
 /// so a wrong call on the street can be traced to the step that caused it.
 struct DebugView: View {
     let radar: SoundRadar
     @Binding var offset: Double
     @Binding var mirror: Bool
     @Environment(\.dismiss) private var dismiss
+    @State private var distanceRef: Double?  // level of the test sound at the reference distance
+    @State private var refMeters = 1.0
+    @State private var tested: [Double: (mean: Double, spread: Double)] = [:]  // true direction -> arrow, fine-tune off
+    @State private var measuring: Double?
 
     var body: some View {
         NavigationStack {
@@ -20,10 +24,12 @@ struct DebugView: View {
                     directionSection(d)
                     classifierSection(d)
                     approachSection(d)
+                    distanceSection(d)
                     decisionSection(d)
                 } else {
                     Section { Text("Waiting for audio…").foregroundStyle(.secondary) }
                 }
+                directionTestSection
                 fineTuneSection
             }
             .navigationTitle("Debug")
@@ -62,6 +68,7 @@ struct DebugView: View {
             Text(d.processed.block.format).font(.callout.monospaced())
             value("Block", "\(f(d.processed.block.duration * 1000, 1)) ms · \(Int((1 / d.processed.block.duration).rounded())) per second")
             value("Stream time", "\(f(d.processed.block.start, 1)) s")
+            value("Processing", radar.health.isEmpty ? "–" : radar.health)
         }
     }
 
@@ -116,15 +123,16 @@ struct DebugView: View {
             value("Level (W)", "\(f(r.db, 1)) dBFS")
             value("Street hum · usual", p.hum.map { "\(f($0, 1)) · \(f(p.usual ?? $0, 1)) dBFS" } ?? "learning…")
             value("Directness", f(r.directness))
-            if let raw = p.rawAzimuth, let az = p.azimuth {
-                value("Direction from pose", "\(Int(raw.rounded()))°")
-                value("+ fine-tune + arm swing", "\(Int(az.rounded()))° · \(pretty(sectorNames[slot(az, of: sectorNames.count)]))")
+            if let raw = p.rawAzimuth, let block = p.blockAzimuth, let az = p.azimuth {
+                value("Direction from pose", "\(Int(raw.rounded()))° (this block)")
+                value("+ fine-tune + arm swing", "\(Int(block.rounded()))° (this block)")
+                value("Arrow, \(f(Detector.arrowSeconds, 1)) s average", "\(Int(az.rounded()))° · \(pretty(sectorNames[slot(az, of: sectorNames.count)]))")
             }
             value("Radar line", "\(f((p.loudness * 24), 0)) dB over hum → \(f(p.loudness)) × \(f(r.directness)) = \(f(p.strength))")
         } header: {
             Text("⑤ Direction and radar line")
         } footer: {
-            Text("Hum = the quietest fifth of the last 30 s; usual = its median. A radar line shows how far a sound stands out above the hum (24 dB = full length) × how directional it is, so a steady roar draws nothing.")
+            Text("One block (21 ms) jitters with street noise, so the arrow averages the last \(f(Detector.arrowSeconds, 1)) s, louder and more direct blocks counting more. Hum = the quietest fifth of the last 30 s; usual = its median. A radar line shows how far a sound stands out above the hum (24 dB = full length) × how directional it is, so a steady roar draws nothing.")
         }
     }
 
@@ -146,10 +154,19 @@ struct DebugView: View {
             } else {
                 Text("No verdict yet").foregroundStyle(.secondary)
             }
+            if let j = d.lastJudged, !j.label.isEmpty {
+                value("Alert decided", "\(alertName(j.label).what) · \(f(j.score))")
+                if !j.beamScores.isEmpty {
+                    value("Through each beam", zip(beamNames, j.beamScores).map { "\($0) \(f($1))" }.joined(separator: " · "))
+                }
+                value("Directions heard", j.sources.isEmpty ? "–" : j.sources.map { "\(Int($0.rounded()))°" }.joined(separator: ", "))
+                value("Beams point", j.beamPointing.map { "\(Int($0.rounded()))°" } ?? "no clear evidence")
+                value("Direction used", j.azimuth.map { "\(Int($0.rounded()))° · \(directionWords($0))" } ?? "unclear")
+            }
         } header: {
-            Text("⑥ Sound classifier (0.5 s windows, every 0.25 s)")
+            Text("⑥ Sound classifier (all-around + 4 beams, 0.5 s windows)")
         } footer: {
-            Text("Apple's raw top guesses; several can be high at once. Bar colour = the app's category (red alert, orange traffic, blue people, grey ignored). Alerts count at ≥ \(f(alertThreshold)), traffic and people at ≥ \(f(categoryThreshold)).")
+            Text("Apple's raw top guesses (all-around mic); several can be high at once. Bar colour = the app's category (red alert, orange traffic, blue people, grey ignored). Alerts need confirming: sirens and other lasting sounds ≥ 0.5 in 2 of the last 3 windows, horns ≥ \(f(alertThreshold)) once, others ≥ 0.7 once or ≥ 0.5 twice in a row (best of the 5 listeners). Critical sounds win over louder warnings. Direction: each frequency's own direction gives the separate sounds heard; the beam that hears the alert best tells which of them it is.")
         }
     }
 
@@ -198,8 +215,87 @@ struct DebugView: View {
                 Text(line).font(.caption.monospaced())
             }
         } header: {
-            Text("⑧ Decisions log, newest first")
+            Text("⑨ Decisions log, newest first")
         }
+    }
+
+    /// Experiment: can the phone tell how far away a sound is?
+    private func distanceSection(_ d: DebugSnapshot) -> some View {
+        let level = d.processed.levelDB
+        return Section {
+            value("Level (1 s average)", "\(f(level, 1)) dBFS")
+            if let ref = distanceRef {
+                value("Distance from loudness", "≈ \(f(metersFromLevel(level, reference: ref, at: refMeters), 1)) m")
+            }
+            Stepper("Reference: \(Int(refMeters)) m", value: $refMeters, in: 1...20)
+            Button(distanceRef == nil ? "The sound is \(Int(refMeters)) m away now" : "Reset: it's \(Int(refMeters)) m away now") {
+                distanceRef = level
+            }
+            value("Directness", f(d.processed.block.reading.directness))
+            if let e = reachEstimate(d.sectors) {
+                value("Reaches you in", "≈ \(f(e.seconds, 1)) s · \(pretty(sectorNames[e.sector])) · +\(f(d.sectors[e.sector].recentRise, 1)) dB/s")
+            } else {
+                value("Reaches you in", "nothing getting louder")
+            }
+        } header: {
+            Text("⑧ Distance (experiment)")
+        } footer: {
+            Text("""
+                Distance from loudness: play a steady sound from a speaker, stand at the reference distance, tap the button, then walk away. \
+                It assumes 6 dB quieter per doubling of distance, so it only holds for the same sound at the same volume. \
+                If it doesn't grow when you walk away, iOS is auto-adjusting the mic level.
+                Reaches you in: from how fast an approaching sound gets louder; needs no reference. It assumes the sound is \
+                coming straight at you at a steady speed and reads high for things passing beside you.
+                Directness: nearer sounds usually read more direct (less echo), but street noise lowers it too.
+                """)
+        }
+    }
+
+    /// Play a sound from a known direction, measure where the arrow points: accuracy, scatter, and the fine-tune that fixes it.
+    private var directionTestSection: some View {
+        let names: [Double: String] = [0: "Ahead", 90: "Left", 180: "Behind", -90: "Right"]
+        return Section {
+            HStack {
+                ForEach([0.0, 90, 180, -90], id: \.self) { truth in
+                    Button(names[truth]!) { Task { await measure(truth) } }
+                        .buttonStyle(.bordered)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .disabled(measuring != nil || radar.debug == nil)
+            if let m = measuring { ProgressView("Measuring \(names[m]!.lowercased()) for 3 s…") }
+            ForEach(tested.keys.sorted(), id: \.self) { truth in
+                let t = tested[truth]!, shown = remainder(calibrated(t.mean, offset: offset, mirror: mirror), 360)
+                value(names[truth]!, "arrow \(Int(shown.rounded()))° · off \(Int(angularDistance(shown, truth).rounded()))° · wobble ±\(Int(t.spread.rounded()))°")
+            }
+            if let fit = fitFineTune(tested.map { ($0.key, $0.value.mean) }) {
+                value("Best fine-tune", "rotate \(Int(fit.offset.rounded()))°\(fit.mirror ? " + mirror" : "") · then off ±\(Int(fit.leftover.rounded()))°")
+                Button("Apply this fine-tune") { offset = fit.offset.rounded(); mirror = fit.mirror }
+                Text(fit.leftover < 15
+                     ? "One rotation explains the error: apply it and the directions should line up."
+                     : "No single rotation fits: some directions are off in different ways. Usually front/back mix-ups, echoes from walls, or your body blocking the sound. Try outdoors away from walls, or hold the phone another way, and test again.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            if !tested.isEmpty { Button("Clear results", role: .destructive) { tested = [:] } }
+        } header: {
+            Text("Direction test")
+        } footer: {
+            Text("Stand still, holding the phone the way you'll run with it. Play a steady sound (a traffic or siren video) from a speaker about 2 m away, then tap where it is. Do at least Ahead and Left; all four also shows front/back mix-ups. Outdoors is best: walls echo. Off = how wrong the arrow is; wobble = how much it moves while the sound stays put.")
+        }
+    }
+
+    /// 3 s of the arrow with the fine-tune taken back out, louder and more direct moments counting more.
+    private func measure(_ truth: Double) async {
+        measuring = truth
+        var samples: [(deg: Double, weight: Double)] = []
+        for _ in 0..<30 {
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let p = radar.debug?.processed, let az = p.azimuth else { continue }
+            let x = az - p.correction - offset
+            samples.append((mirror ? -x : x, p.block.reading.ww * p.block.reading.directness))
+        }
+        tested[truth] = circularMean(samples)
+        measuring = nil
     }
 
     private var fineTuneSection: some View {
@@ -210,7 +306,7 @@ struct DebugView: View {
         } header: {
             Text("Fine-tune direction")
         } footer: {
-            Text("Directions follow the motion sensors, so upright, tilted or flat all work. Only adjust if a clap in front of you still doesn't point to Ahead.")
+            Text("Directions follow the motion sensors, so upright, tilted or flat all work. The direction test above sets these for you.")
         }
     }
 

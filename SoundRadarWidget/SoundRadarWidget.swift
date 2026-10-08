@@ -31,20 +31,31 @@ struct RadarLiveActivity: Widget {
                         .foregroundStyle(.secondary)
                 }
                 DynamicIslandExpandedRegion(.bottom) {
+                    let warning = state.status == .warning && !stale
                     HStack(spacing: 12) {
-                        StatusIcon(state: state, stale: stale).font(.title).foregroundStyle(tint)
+                        StatusIcon(state: state, stale: stale).font(warning ? .largeTitle : .title).foregroundStyle(tint)
                         VStack(alignment: .leading) {
-                            Text(state.headline(stale: stale)).font(.headline)
-                            Text(state.subline(stale: stale)).font(.subheadline).foregroundStyle(.secondary)
+                            Text(state.headline(stale: stale))
+                                .font(warning ? .title2.bold() : .headline)
+                                .foregroundStyle(warning ? tint : .primary)
+                            state.sublineText(stale: stale).font(warning ? .title3 : .subheadline).foregroundStyle(.secondary)
                         }
                         Spacer(minLength: 0)
                         SessionButtons(paused: state.status == .paused)
                     }
                 }
             } compactLeading: {
-                Image(systemName: "ear.badge.waveform").foregroundStyle(tint)
+                if state.status == .warning && !stale {
+                    StatusIcon(state: state, stale: stale).foregroundStyle(tint)  // arrow toward the sound
+                } else {
+                    Image(systemName: "ear.badge.waveform").foregroundStyle(tint)
+                }
             } compactTrailing: {
-                StatusIcon(state: state, stale: stale).foregroundStyle(tint)
+                if state.status == .warning && !stale && !state.short.isEmpty {
+                    Text(state.short).font(.caption.bold()).foregroundStyle(tint).lineLimit(1)  // "Horn", "Siren"
+                } else {
+                    StatusIcon(state: state, stale: stale).foregroundStyle(tint)
+                }
             } minimal: {
                 StatusIcon(state: state, stale: stale).foregroundStyle(tint)
             }
@@ -65,7 +76,7 @@ struct LockScreenStatus: View {
                 .foregroundStyle(state.tint(stale: stale))
             VStack(alignment: .leading, spacing: 2) {
                 Text(state.headline(stale: stale)).font(.headline)
-                Text(state.subline(stale: stale)).font(.subheadline).foregroundStyle(.secondary)
+                state.sublineText(stale: stale).font(.subheadline).foregroundStyle(.secondary)
                 Text(startedAt, style: .timer).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
             }
             Spacer(minLength: 0)
@@ -128,8 +139,8 @@ extension RadarActivity.ContentState {
         if stale { return .gray }
         return switch status {
         case .listening: .green
-        case .warning: .red
-        case .interrupted: .orange
+        case .warning: critical ? .red : .orange
+        case .interrupted: .yellow
         case .paused: .gray
         }
     }
@@ -137,4 +148,10 @@ extension RadarActivity.ContentState {
     func headline(stale: Bool) -> String { stale ? "Not updating" : title }
 
     func subline(stale: Bool) -> String { stale ? "Sound Radar may have stopped. Open it to check." : detail }
+
+    /// "behind on your left", plus "· 3 sec ago" once the warning has stopped (counts up on its own).
+    func sublineText(stale: Bool) -> Text {
+        if !stale, status == .warning, let endedAt { return Text("\(detail) · \(endedAt, style: .relative) ago") }
+        return Text(subline(stale: stale))
+    }
 }

@@ -54,8 +54,8 @@ enum HapticMethod: String, Codable, CaseIterable, Identifiable {
 }
 
 struct HapticSettings: Codable, Equatable {
-    var horn = HapticPattern(rhythm: "... ... ...", intensity: 1, sharpness: 0.9)
-    var approach = HapticPattern(rhythm: "- - -", intensity: 1, sharpness: 0.3)
+    var critical = HapticPattern(rhythm: "... ... ...", intensity: 1, sharpness: 0.9)
+    var warning = HapticPattern(rhythm: "- - -", intensity: 1, sharpness: 0.3)
     var method = HapticMethod.coreHaptics
     var notifyWhenAway = true  // also post a notification for a warning while the app isn't on screen
 
@@ -230,7 +230,7 @@ nonisolated final class NotificationPresenter: NSObject, UNUserNotificationCente
         let id: Int
         let name: String
         let method: HapticMethod
-        let pattern: HapticPattern?  // nil = the user's horn pattern
+        let pattern: HapticPattern?  // nil = the user's critical pattern
         let micOn: Bool
         var result = ""
         var felt: Bool?
@@ -245,7 +245,7 @@ nonisolated final class NotificationPresenter: NSObject, UNUserNotificationCente
         wasPaused = radar.paused
         steps = [
             Step(id: 1, name: "Strong buzz · custom pattern · mic on", method: .coreHaptics, pattern: Self.strongBuzz, micOn: true),
-            Step(id: 2, name: "Your horn pattern · custom pattern · mic on", method: .coreHaptics, pattern: nil, micOn: true),
+            Step(id: 2, name: "Your critical pattern · custom pattern · mic on", method: .coreHaptics, pattern: nil, micOn: true),
             Step(id: 3, name: "System vibration · mic on", method: .systemBuzz, pattern: HapticPattern(rhythm: "-"), micOn: true),
             Step(id: 4, name: "Strong buzz · custom pattern · mic paused", method: .coreHaptics, pattern: Self.strongBuzz, micOn: false),
             Step(id: 5, name: "System vibration · mic paused", method: .systemBuzz, pattern: HapticPattern(rhythm: "-"), micOn: false),
@@ -260,7 +260,7 @@ nonisolated final class NotificationPresenter: NSObject, UNUserNotificationCente
             radar.setPaused(!step.micOn)
             try? await Task.sleep(for: .seconds(1.5))  // let the mic actually stop / start
         }
-        let r = await radar.haptics.play(step.pattern ?? settings.horn, title: "Haptics check", body: step.name, via: step.method)
+        let r = await radar.haptics.play(step.pattern ?? settings.critical, title: "Haptics check", body: step.name, via: step.method)
         steps[i].result = r.detail
         current = i
     }
@@ -326,7 +326,7 @@ nonisolated final class NotificationPresenter: NSObject, UNUserNotificationCente
     private(set) var startedAt: Date?
     @ObservationIgnored private var task: Task<Void, Never>?
 
-    /// Each round uses the next method; horn and getting-closer patterns alternate per full cycle of methods.
+    /// Each round uses the next method; critical and warning patterns alternate per full cycle of methods.
     func start(_ haptics: Haptics, settings: HapticSettings, mic: @escaping () -> String) {
         let order = HapticMethod.allCases.filter(methods.contains)
         guard !order.isEmpty else { return }
@@ -341,11 +341,11 @@ nonisolated final class NotificationPresenter: NSObject, UNUserNotificationCente
                 self?.nextAt = .now + interval
                 try? await Task.sleep(for: .seconds(interval))
                 guard let self, !Task.isCancelled else { break }
-                let method = order[round % order.count], horn = (round / order.count) % 2 == 0
+                let method = order[round % order.count], critical = (round / order.count) % 2 == 0
                 let state = appState(), micState = mic()
-                let result = await haptics.play(horn ? settings.horn : settings.approach, title: "Haptic test, round \(round + 1)",
-                                                body: "\(method.name) · \(horn ? "horn" : "getting closer")", via: method)
-                attempts.append(Attempt(round: round + 1, time: .now, method: method, category: horn ? "horn/siren" : "getting closer",
+                let result = await haptics.play(critical ? settings.critical : settings.warning, title: "Haptic test, round \(round + 1)",
+                                                body: "\(method.name) · \(critical ? "critical" : "warning")", via: method)
+                attempts.append(Attempt(round: round + 1, time: .now, method: method, category: critical ? "critical" : "warning",
                                         appState: state, mic: micState, ok: result.ok, result: result.detail))
             }
             self?.finish()
@@ -396,7 +396,7 @@ nonisolated func diagnose(felt: [Bool], results: [String]) -> String {
         return "It only vibrates with the mic paused: iOS mutes vibration while the app records. During the mic-on steps: \(results[0])."
     }
     if !felt[0] && felt[2] { return "The system vibration works but Core Haptics doesn't: \(results[0])." }
-    if felt[0] && !felt[1] { return "The strong buzz works but your horn pattern is too faint: raise Strength or use long buzzes (-)." }
+    if felt[0] && !felt[1] { return "The strong buzz works but your critical pattern is too faint: raise Strength or use long buzzes (-)." }
     if felt[0] && felt[1] && felt[2] { return "Vibration works with the mic on. Next: the locked / background test below." }
     return "Mixed result: compare the steps above."
 }

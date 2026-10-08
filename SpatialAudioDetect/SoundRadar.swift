@@ -7,6 +7,16 @@ import UIKit
 
 nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     let classifier = SoundClassifier()
+    let beamClassifiers = beamAzimuths.indices.map { SoundClassifier(beam: $0) }  // ahead, left, behind, right
+    let words = WordListener()
+    private let steerLock = NSLock()
+    private var steering: [SIMD3<Float>] = []
+
+    /// Where to aim the beams (from the Detector, which knows the phone's pose and arm swing). Any thread.
+    func steer(_ weights: [SIMD3<Float>]) { steerLock.withLock { steering = weights } }
+
+    /// Blocks the classifiers skipped because the phone couldn't keep up.
+    var droppedBlocks: Int { ([classifier] + beamClassifiers).map(\.droppedBlocks).reduce(0, +) }
     var onBlock: (@Sendable (Block) -> Void)?
     private var maker = BlockMaker()  // one clock shared by direction and classifier
     private var recordURL: URL?
@@ -28,9 +38,11 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
                                         commonFormat: format.commonFormat, interleaved: format.isInterleaved)
             }
             let saved = (try? file?.write(from: buf)) != nil
-            let made = maker.make(buf, savingAudio: saved)
+            let made = maker.make(buf, savingAudio: saved, steering: steerLock.withLock { steering })
             onBlock?(made.block)
             classifier.feed(made.omni, sampleRate: format.sampleRate, at: made.at)
+            for (k, beam) in made.beams.enumerated() { beamClassifiers[k].feed(beam, sampleRate: format.sampleRate, at: made.at) }
+            words.feed(made.omni, sampleRate: format.sampleRate, at: made.block.start)
         }
     }
 }
@@ -45,6 +57,11 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     var debug: DebugSnapshot?      // refreshed 10×/s for the debug screen
     private(set) var recorder: Recorder?
     var recordedFiles: [URL] = []  // last finished recording, for sharing
+    var health = ""                  // processing: blocks per second, skipped blocks, phone temperature
+    @ObservationIgnored private var blocksThisSecond = 0
+    @ObservationIgnored private var lastThermal = ProcessInfo.ThermalState.nominal
+    var wordStatus = "off"           // the name / danger-word listener
+    var lastTranscript = ""          // what it last heard, to check it can understand the name
     let haptics = Haptics()
     let hapticTest = HapticTest()
     private(set) var paused = false              // you paused it (screen, Dynamic Island or Lock Screen)
@@ -77,6 +94,8 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     @ObservationIgnored private var lastTrouble: String?
     @ObservationIgnored private var activity: Activity<RadarActivity>?
     @ObservationIgnored private var shown: (state: RadarActivity.ContentState, at: Date)?
+    // The island keeps the last warning 8 s after it ends: it's often still expanded, or glanced at, by then.
+    @ObservationIgnored private var held: (alert: Alert, endedAt: Date?)?
 
     /// Whether audio blocks are still arriving: tells if capture survives the background / lock screen.
     var micStatus: String {
@@ -111,6 +130,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             listeningStarted = false
             paused = false
             detector.clearAlert()
+            held = nil
             let session = session
             queue.async { session.stopRunning() }
             log("stopped")
@@ -129,6 +149,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         paused = pause
         if pause {
             detector.clearAlert()
+            held = nil
         } else {
             lastBlockAt = .now  // give the mic a moment before calling it stalled
         }
@@ -171,6 +192,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         let optIn = haptics.allowWhileRecording()
         log("haptics while recording: " + (optIn.map { "opt-in failed: \($0)" } ?? "allowed"))
         if HapticSettings.load().notifyWhenAway { await haptics.askForNotifications() }
+        await updateWords()
     }
 
     /// Build the spatial-audio capture session once; false (with `problem` set) if this iPhone can't.
@@ -188,9 +210,26 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             guard let self else { return }
             Task { @MainActor in self.add(b) }
         }
-        tap.classifier.onResult = { [weak self] heard in
+        for c in [tap.classifier] + tap.beamClassifiers {
+            c.onResult = { [weak self] heard in
+                guard let self else { return }
+                Task { @MainActor in self.hear(heard) }
+            }
+        }
+        tap.words.onMatch = { [weak self] phrase, isName, start, end in
             guard let self else { return }
-            Task { @MainActor in self.hear(heard) }
+            Task { @MainActor in self.heardWords(phrase, isName: isName, from: start, to: end) }
+        }
+        tap.words.onStatus = { [weak self] status in
+            guard let self else { return }
+            Task { @MainActor in
+                self.wordStatus = status
+                self.log("words: \(status)")
+            }
+        }
+        tap.words.onTranscript = { [weak self] text in
+            guard let self else { return }
+            Task { @MainActor in self.lastTranscript = text }
         }
         output.setSampleBufferDelegate(tap, queue: queue)
 
@@ -235,6 +274,8 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         lastBlockAt = .now
         let pulse = detector.alertPulse
         let p = detector.add(b, motion: m)
+        tap.steer(detector.beamWeights)
+        blocksThisSecond += 1
         react(since: pulse)
         recorder?.block(p, kind: detector.kind, alert: detector.alert)
         flushLog()
@@ -242,6 +283,20 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             nextDebug = detector.clock + 0.1
             debug = detector.snapshot()
         }
+    }
+
+    /// Name / danger words changed (Alerts screen), or a session started: (re)start or stop the transcriber.
+    func updateWords() async {
+        let d = UserDefaults.standard
+        await tap.words.configure(names: phrases(d.string(forKey: "listenNames") ?? ""),
+                                  words: phrases(d.string(forKey: "listenWords") ?? defaultDangerWords))
+    }
+
+    private func heardWords(_ phrase: String, isName: Bool, from start: Double, to end: Double) {
+        let pulse = detector.alertPulse
+        detector.heardWords(phrase, isName: isName, from: start, to: end)
+        react(since: pulse)
+        flushLog()
     }
 
     private func hear(_ h: Heard) {
@@ -256,18 +311,22 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     /// runs while the app is in the background), plus a notification when the app isn't on screen.
     private func react(since pulse: Int) {
         guard detector.alertPulse != pulse, let a = detector.alert else { return }
+        refreshActivity()  // straight away, not at the next 1 s tick: this is what pops the island open
         let s = HapticSettings.load(), haptics = haptics
         let body = a.what + " " + directionWords(a.azimuth)
+        let pattern = a.level == .critical ? s.critical : s.warning, title = a.level == .critical ? "Watch out" : "Heads up"
         Task {
-            let r = await haptics.play(a.isApproach ? s.approach : s.horn, title: "Watch out", body: body, via: s.method)
+            let r = await haptics.play(pattern, title: title, body: body, via: s.method)
             if !r.ok { self.log("haptic \(s.method.name): \(r.detail) (\(appState()))") }
         }
         // ponytail: one notification per new warning or per 10 s, so a long siren doesn't flood the lock screen
-        guard s.notifyWhenAway, s.method != .notification, UIApplication.shared.applicationState != .active,
+        // The island pops open on its own (refreshActivity), so a notification on top would only double the buzz.
+        let islandUp = activity.map { [.active, .stale].contains($0.activityState) } ?? false
+        guard s.notifyWhenAway, s.method != .notification, !islandUp, UIApplication.shared.applicationState != .active,
               lastNotified.map({ $0.what != a.what || Date.now.timeIntervalSince($0.at) > 10 }) ?? true else { return }
         lastNotified = (a.what, .now)
         Task {
-            let r = await haptics.play(a.isApproach ? s.approach : s.horn, title: "Watch out", body: body, via: .notification)
+            let r = await haptics.play(pattern, title: title, body: body, via: .notification)
             if !r.ok { self.log("notification: \(r.detail)") }
         }
     }
@@ -349,6 +408,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
 
     /// Log when the mic goes quiet / comes back, and keep the Live Activity current.
     private func tick() {
+        // "Works, then stops after a while": blocks arriving slower than ~47/s, skipped blocks or heat show why.
+        let thermal = ProcessInfo.processInfo.thermalState
+        let heat = ["normal", "warm", "hot (iOS slows the app)", "critical"][min(thermal.rawValue, 3)]
+        if thermal != lastThermal {
+            log("phone temperature: \(heat)")
+            lastThermal = thermal
+        }
+        let dropped = tap.droppedBlocks
+        health = "\(blocksThisSecond) blocks/s · \(dropped) skipped · \(heat)"
+        blocksThisSecond = 0
         let trouble = micTrouble
         if trouble != lastTrouble {
             log(trouble.map { "mic trouble: \($0) (\(appState()))" } ?? "audio flowing again")
@@ -360,8 +429,15 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     // MARK: Dynamic Island / Lock Screen
 
     private func liveState() -> RadarActivity.ContentState {
-        .make(paused: paused, micTrouble: micTrouble,
-              warning: detector.alert.map { ($0.what, $0.azimuth, directionWords($0.azimuth)) })
+        if let a = detector.alert {
+            held = (a, nil)
+        } else if let h = held, h.endedAt == nil {
+            held = (h.alert, .now)
+        }
+        if let end = held?.endedAt, Date.now.timeIntervalSince(end) > 8 { held = nil }
+        return .make(paused: paused, micTrouble: micTrouble,
+                     warning: held.map { ($0.alert.what, $0.alert.azimuth, directionWords($0.alert.azimuth), $0.alert.short,
+                                         $0.alert.level == .critical, $0.endedAt) })
     }
 
     /// While listening, the content goes stale 90 s after the last update, and updates come at least every 30 s,
@@ -406,10 +482,17 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         guard let activity else { return }
         let state = liveState()
         let heartbeat = state.status != .paused && Date.now.timeIntervalSince(shown?.at ?? .distantPast) > 30
+        let popOpen = islandAlertDue(state, previous: shown?.state)
         guard state != shown?.state || heartbeat else { return }
         shown = (state, .now)
         let content = content(state)
-        Task { await activity.update(content) }
+        var alert: AlertConfiguration?
+        if popOpen {
+            // Expands the Dynamic Island for a few seconds (and lights the Lock Screen) showing what and where.
+            alert = AlertConfiguration(title: "\(state.title)", body: "\(state.detail)", sound: .default)
+            log("Dynamic Island alert: \(state.title) \(state.detail)")
+        }
+        Task { await activity.update(content, alertConfiguration: alert) }
     }
 
     private func log(_ message: String) {

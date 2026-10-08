@@ -2,6 +2,10 @@ import SwiftUI
 import UIKit
 import Playgrounds
 
+extension AlertLevel {
+    var color: Color { self == .critical ? .red : .orange }
+}
+
 extension SoundKind {
     var color: Color {
         switch self {
@@ -17,6 +21,7 @@ struct ContentView: View {
     @State private var radar = SoundRadar.shared
     @State private var debugging = false
     @State private var tuningHaptics = false
+    @State private var explaining = false
     // Fine-tune, in case the phone's axes differ from what the app assumes.
     @AppStorage("rotate") private var offset = 0.0
     @AppStorage("mirror") private var mirror = false
@@ -30,15 +35,21 @@ struct ContentView: View {
                 Spacer(minLength: 0)
             }
             .padding()
-            .background { (radar.alert == nil ? Color(.systemGroupedBackground) : .red).ignoresSafeArea() }
+            .background { (radar.alert?.level.color ?? Color(.systemGroupedBackground)).ignoresSafeArea() }
             .navigationTitle("Sound Radar")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                Button("Haptics", systemImage: "hand.tap") { tuningHaptics = true }
-                Button("Debug", systemImage: "ladybug") { debugging = true }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("How it's measured", systemImage: "function") { explaining = true }
+                }
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button("Alerts", systemImage: "bell.badge") { tuningHaptics = true }
+                    Button("Debug", systemImage: "ladybug") { debugging = true }
+                }
             }
             .sheet(isPresented: $debugging) { DebugView(radar: radar, offset: $offset, mirror: $mirror) }
             .sheet(isPresented: $tuningHaptics) { HapticsView(radar: radar) }
+            .sheet(isPresented: $explaining) { PipelineView(radar: radar) }
         }
         .onChange(of: offset, initial: true) { radar.setCalibration(offset: offset, mirror: mirror) }
         .onChange(of: mirror) { radar.setCalibration(offset: offset, mirror: mirror) }
@@ -62,7 +73,8 @@ struct ContentView: View {
             } else if let trouble = radar.micTrouble {
                 ("mic.slash.fill", .orange, "Not hearing anything", trouble)
             } else if let a = radar.alert {
-                (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", .red, "Watch out!", "\(a.what) \(directionWords(a.azimuth))")
+                (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", a.level.color,
+                 a.level == .critical ? "Watch out!" : "Heads up", "\(a.what) \(directionWords(a.azimuth))")
             } else {
                 switch radar.kind {
                 case .traffic: ("car.fill", .orange, "Traffic nearby", "Normal traffic, mostly \(directionWords(radar.loudestAzimuth(of: .traffic)))")
@@ -128,12 +140,12 @@ struct ContentView: View {
                         ctx.stroke(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)),
                                    with: .color(.secondary.opacity(0.35)), lineWidth: 1.5)
                     }
-                    if let az = radar.alert?.azimuth {
+                    if let alert = radar.alert, let az = alert.azimuth {
                         let a = az, arc = Array(stride(from: -25.0, through: 25, by: 5))
                         var wedge = Path()
                         wedge.addLines(arc.map { point(a + $0, r1) } + arc.reversed().map { point(a + $0, r0) })
                         wedge.closeSubpath()
-                        ctx.fill(wedge, with: .color(.red.opacity(0.3)))
+                        ctx.fill(wedge, with: .color(alert.level.color.opacity(0.3)))
                     }
                     for (i, bin) in radar.bins.enumerated() where bin.strength > 0.01 {
                         let a = Double(i) / Double(radar.bins.count) * 360

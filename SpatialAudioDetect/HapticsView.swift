@@ -2,10 +2,12 @@ import AVFAudio
 import CoreHaptics
 import SwiftUI
 
-/// Edit the warning patterns, pick how they're delivered, and run the background / on-the-move test.
+/// Alert levels, words to listen for, the vibration for each level, and the haptics tests.
 struct HapticsView: View {
     let radar: SoundRadar
     @State private var settings = HapticSettings.load()
+    @AppStorage("listenNames") private var names = ""
+    @AppStorage("listenWords") private var words = defaultDangerWords
     @State private var preview = ""
     @State private var check = HapticCheck()
     @Environment(\.dismiss) private var dismiss
@@ -13,9 +15,11 @@ struct HapticsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                levelsSection
+                wordsSection
+                patternSection("Critical vibration", $settings.critical)
+                patternSection("Warning vibration", $settings.warning)
                 HapticCheckSection(radar: radar, settings: settings, check: check)
-                patternSection("Horn, siren, bell, shout", $settings.horn)
-                patternSection("Something getting closer", $settings.approach)
                 Section {
                     Picker("Warnings use", selection: $settings.method) {
                         ForEach(HapticMethod.allCases) { Text($0.name).tag($0) }
@@ -31,11 +35,53 @@ struct HapticsView: View {
                 HapticTestSection(test: radar.hapticTest, haptics: radar.haptics, settings: settings, mic: { radar.micStatus })
             }
             .onDisappear { check.abandon(radar) }  // never leave the mic off after an unfinished check
-            .navigationTitle("Haptics")
+            .navigationTitle("Alerts")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { Button("Done") { dismiss() } }
             .onChange(of: settings) { settings.save() }
         }
+    }
+
+    private var levelsSection: some View {
+        Section {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Critical").bold()
+                    Text("Sirens, skidding tyres, screams, trains; a horn behind you or to your side; your danger words; anything near (much louder than this street usually is). Pops the Dynamic Island open.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red) }
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Warning").bold()
+                    Text("A horn ahead of you, bike bells, reversing beeps, dogs, shouting, something getting closer, someone saying your name. Shows in the Dynamic Island without popping it open.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } icon: { Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange) }
+        } header: {
+            Text("Alert levels")
+        }
+    }
+
+    private var wordsSection: some View {
+        Section {
+            TextField("Your name (and nicknames)", text: $names)
+                .textContentType(.givenName)
+                .autocorrectionDisabled()
+            TextField("Danger words", text: $words, axis: .vertical)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            LabeledContent("Listener", value: radar.wordStatus)
+            if !radar.lastTranscript.isEmpty {
+                LabeledContent("Last heard") { Text(radar.lastTranscript.suffix(80)).foregroundStyle(.secondary) }
+            }
+        } header: {
+            Text("Words to listen for")
+        } footer: {
+            Text("Separate with commas. Your name gives a warning, danger words a critical alert, both with the direction of the voice. Transcribed on this iPhone only, nothing is stored or sent. “Last heard” shows what it understood, to check it gets your name right. Empty both to switch it off (saves battery).")
+        }
+        .onChange(of: names) { Task { await radar.updateWords() } }
+        .onChange(of: words) { Task { await radar.updateWords() } }
     }
 
     private func patternSection(_ title: String, _ pattern: Binding<HapticPattern>) -> some View {

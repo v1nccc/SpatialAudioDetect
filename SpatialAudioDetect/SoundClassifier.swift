@@ -35,6 +35,11 @@ nonisolated struct Heard: Sendable {
     var alertScore: Double  // best horn/siren/bell/shout confidence, for tuning on a real street
     var start: Double, end: Double
     var top: [(id: String, confidence: Double)]  // Apple's raw top guesses, for the debug screen
+    var beam: Int? = nil                        // nil = the all-around mic; else index into beamAzimuths
+    var alerts: [String: Double] = [:]          // score of every alert label (horns, sirens, bells, barks…)
+
+    /// Alert scores, also for verdicts made without the full list (tests, old fakes).
+    var alertScores: [String: Double] { alerts.isEmpty && kind == .alert ? [label: alertScore] : alerts }
 }
 
 /// "car_horn" -> "Car horn"
@@ -43,12 +48,25 @@ nonisolated func pretty(_ id: String) -> String {
     return s.prefix(1).uppercased() + s.dropFirst()
 }
 
-/// Runs Apple's sound classifier on the omni channel; a verdict every 0.25 s.
+/// Runs Apple's sound classifier on one signal (the all-around mic or one beam); a verdict every 0.25 s.
 nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecked Sendable {
+    let beam: Int?
     var onResult: (@Sendable (Heard) -> Void)?
     private var analyzer: SNAudioStreamAnalyzer?
     private var format: AVAudioFormat?
     private let queue = DispatchQueue(label: "sound-classify")
+    private let lock = NSLock()
+    private var pending = 0, dropped = 0
+    private let maxBacklog: Int
+
+    /// `realTime`: skip audio rather than fall behind (live). The replay tool feeds faster than real time, so it doesn't.
+    init(beam: Int? = nil, realTime: Bool = true) {
+        self.beam = beam
+        maxBacklog = realTime ? 24 : .max  // ~0.5 s of blocks waiting
+    }
+
+    /// Blocks skipped because the phone couldn't keep up (live only).
+    var droppedBlocks: Int { lock.withLock { dropped } }
 
     /// Call from one serial queue (the capture queue). `at` = frames since capture start.
     func feed(_ samples: [Float], sampleRate: Double, at: AVAudioFramePosition) {
@@ -66,7 +84,16 @@ nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecke
               let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else { return }
         buf.frameLength = buf.frameCapacity
         samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
-        queue.async { analyzer.analyze(buf, atAudioFramePosition: at) }
+        let behind = lock.withLock { () -> Bool in
+            if pending >= maxBacklog { dropped += 1; return true }
+            pending += 1
+            return false
+        }
+        if behind { return }
+        queue.async {
+            analyzer.analyze(buf, atAudioFramePosition: at)
+            self.lock.withLock { self.pending -= 1 }
+        }
     }
 
     /// Process everything fed so far and deliver the last verdicts (replay tool).
@@ -78,6 +105,7 @@ nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecke
         let (kind, label) = classify(scores)
         onResult?(Heard(kind: kind, label: label, alertScore: scores.filter { soundKinds[$0.key] == .alert }.values.max() ?? 0,
                         start: r.timeRange.start.seconds, end: r.timeRange.end.seconds,
-                        top: r.classifications.prefix(6).map { ($0.identifier, $0.confidence) }))
+                        top: r.classifications.prefix(6).map { ($0.identifier, $0.confidence) }, beam: beam,
+                        alerts: scores.filter { soundKinds[$0.key] == .alert }))
     }
 }

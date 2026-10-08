@@ -50,10 +50,62 @@ nonisolated struct Reading: Sendable {
     /// Power a supercardioid beam aimed along `u` (phone frame, unit length) picks up:
     /// full from that direction, about −9 dB from the sides, −12 dB from behind it.
     func beamPower(toward u: SIMD3<Double>) -> Double {
-        let a = 0.63, x = simd_dot(u, foaFront), y = simd_dot(u, foaLeft), z = simd_dot(u, foaUp)
+        let a = beamShape, x = simd_dot(u, foaFront), y = simd_dot(u, foaLeft), z = simd_dot(u, foaUp)
         let along = x * wx + y * wy + z * wz
         let spread = x * x * xx + y * y * yy + z * z * zz + 2 * (x * y * xy + x * z * xz + y * z * yz)
         return max((1 - a) * (1 - a) * ww + 2 * a * (1 - a) * along + a * a * spread, 0)
+    }
+}
+
+/// Beam shape: 0.5 = cardioid, 0.63 = supercardioid (full ahead, about −9 dB to the sides, −12 dB behind).
+nonisolated let beamShape = 0.63
+
+/// What a supercardioid mic aimed along `w` (ambisonic weights: front, left, up) would record. Channels W, Y, Z, X.
+nonisolated func beamSignal(_ ch: [[Float]], _ w: SIMD3<Float>) -> [Float] {
+    let a = Float(beamShape)
+    var out = vDSP.multiply(1 - a, ch[0])
+    out = vDSP.add(multiplication: (ch[3], a * w.x), out)
+    out = vDSP.add(multiplication: (ch[1], a * w.y), out)
+    return vDSP.add(multiplication: (ch[2], a * w.z), out)
+}
+
+/// Real FFT of up to 1024 samples (Hann window, zero-padded): bins 0..<512 as (re, im).
+nonisolated final class Spectrum: @unchecked Sendable {
+    static let size = 1024
+    private let fft = vDSP.FFT(log2n: 10, radix: .radix2, ofType: DSPSplitComplex.self)!
+    private let window = vDSP.window(ofType: Float.self, usingSequence: .hanningDenormalized, count: size, isHalfWindow: false)
+
+    func callAsFunction(_ x: [Float]) -> (re: [Float], im: [Float]) {
+        let n = min(x.count, Self.size), half = Self.size / 2
+        let input = vDSP.multiply(Array(x.prefix(n)), Array(window.prefix(n))) + [Float](repeating: 0, count: Self.size - n)
+        var inRe = [Float](repeating: 0, count: half), inIm = inRe, outRe = inRe, outIm = inRe
+        inRe.withUnsafeMutableBufferPointer { ir in
+            inIm.withUnsafeMutableBufferPointer { ii in
+                outRe.withUnsafeMutableBufferPointer { or in
+                    outIm.withUnsafeMutableBufferPointer { oi in
+                        var split = DSPSplitComplex(realp: ir.baseAddress!, imagp: ii.baseAddress!)
+                        input.withUnsafeBytes { vDSP_ctoz($0.bindMemory(to: DSPComplex.self).baseAddress!, 2, &split, 1, vDSP_Length(half)) }
+                        var out = DSPSplitComplex(realp: or.baseAddress!, imagp: oi.baseAddress!)
+                        fft.forward(input: split, output: &out)
+                    }
+                }
+            }
+        }
+        return (outRe, outIm)
+    }
+}
+
+/// Acoustic intensity of each frequency from 300 Hz to 4 kHz: phone-frame vector (xyz, length = directional power)
+/// and that frequency's total power |W|² (w). Channels W, Y, Z, X.
+nonisolated func binIntensities(_ ch: [[Float]], sampleRate: Double, spectrum: Spectrum) -> [SIMD4<Float>] {
+    let df = sampleRate / Double(Spectrum.size), lo = max(Int(300 / df), 1), hi = min(Int(4000 / df), Spectrum.size / 2 - 1)
+    guard lo < hi else { return [] }
+    let (w, y, z, x) = (spectrum(ch[0]), spectrum(ch[1]), spectrum(ch[2]), spectrum(ch[3]))
+    let front = SIMD3<Float>(foaFront), left = SIMD3<Float>(foaLeft), up = SIMD3<Float>(foaUp)
+    return (lo...hi).map { k in
+        func cross(_ c: (re: [Float], im: [Float])) -> Float { w.re[k] * c.re[k] + w.im[k] * c.im[k] }  // Re(conj(W)·C)
+        let v = cross(x) * front + cross(y) * left + cross(z) * up
+        return SIMD4(v, w.re[k] * w.re[k] + w.im[k] * w.im[k])
     }
 }
 
@@ -102,6 +154,157 @@ nonisolated struct DirectionSample: Sendable {
     var azimuth: Double  // runner-relative
     var power: Double    // direct-sound power, the weight
     var strength: Double // 0…1 as drawn on the radar
+    var db = -120.0      // overall level (W, after the high-pass), dBFS
+    var spec: [SIMD3<Float>] = []  // per frequency: intensity in the runner's frame (x ahead, y left) and power (z)
+}
+
+/// Shortest angle between two directions, degrees (0…180).
+nonisolated func angularDistance(_ a: Double, _ b: Double) -> Double { abs(remainder(a - b, 360)) }
+
+/// Directions sounds came from in [start, end), most distinct first. Each frequency gets its own direction (averaged
+/// over the window) and one vote weighted by how clearly directional it is, not how loud: a siren's few strong tones
+/// then form their own direction even under louder people talking, instead of merging into one in between.
+nonisolated func soundSources(_ samples: [DirectionSample], from start: Double, to end: Double) -> [Double] {
+    histogramPeaks(sourceHistogram(samples, from: start, to: end))
+}
+
+/// The votes behind soundSources: 36 directions (10° each, 0 = ahead, counter-clockwise), each frequency's
+/// window-averaged direction voting with its directness².
+nonisolated func sourceHistogram(_ samples: [DirectionSample], from start: Double, to end: Double) -> [Double] {
+    var sum: [SIMD3<Double>] = []
+    for s in samples where s.t >= start && s.t < end && !s.spec.isEmpty {
+        if sum.isEmpty { sum = Array(repeating: .zero, count: s.spec.count) }
+        guard s.spec.count == sum.count else { continue }
+        for k in sum.indices { sum[k] += SIMD3<Double>(s.spec[k]) }
+    }
+    var h = [Double](repeating: 0, count: 36)
+    for b in sum where b.z > 0 {
+        let directness = min((b.x * b.x + b.y * b.y).squareRoot() / b.z, 1)
+        h[slot(atan2(b.y, b.x) * 180 / .pi, of: h.count)] += directness * directness
+    }
+    return h
+}
+
+/// Peaks of a circular direction histogram (bins of 360/count degrees), strongest first, at most 3.
+nonisolated func histogramPeaks(_ h: [Double]) -> [Double] {
+    let n = h.count, width = 360 / Double(max(n, 1))
+    guard n > 2 else { return [] }
+    let smooth = (0..<n).map { 0.5 * h[($0 + n - 1) % n] + h[$0] + 0.5 * h[($0 + 1) % n] }
+    guard let top = smooth.max(), top > 0 else { return [] }
+    let peaks = (0..<n).filter { i in
+        smooth[i] >= 0.15 * top && smooth[i] >= smooth[(i + n - 1) % n] && smooth[i] > smooth[(i + 1) % n]
+    }
+    return peaks.sorted { smooth[$0] > smooth[$1] }.prefix(3).map { i in  // power-weighted centre of the peak
+        var c = 0.0, s = 0.0
+        for d in -1...1 {
+            let a = Double(i + d) * width * .pi / 180, w = h[(i + d + n) % n]
+            c += w * cos(a)
+            s += w * sin(a)
+        }
+        return atan2(s, c) * 180 / .pi
+    }
+}
+
+/// The 4 directional beams the classifier also listens through (runner's frame): ahead, left, behind, right.
+nonisolated let beamAzimuths: [Double] = [0, 90, 180, 270]
+nonisolated let beamNames = ["ahead", "left", "behind", "right"]
+
+/// Where the beam scores point: each beam's direction, weighted by how much more it heard the sound than the
+/// least-hearing beam. Biased (the clearest beam is the one that best avoids *other* sounds), so only used to
+/// choose between the directions in soundSources. Nil without real evidence: the beams barely disagree, or every
+/// beam hears the sound clearly (nothing masks it from any side, so the differences are just classifier noise).
+// ponytail: 0.25 spread from synthetic scenes; weaker spreads pointed at the wrong source half the time
+nonisolated func beamEstimate(_ scores: [Double]) -> Double? {
+    guard scores.count == beamAzimuths.count, let lo = scores.min(), let hi = scores.max(),
+          hi - lo >= 0.25, lo < alertThreshold else { return nil }
+    var c = 0.0, s = 0.0
+    for (k, score) in scores.enumerated() {
+        c += (score - lo) * cos(beamAzimuths[k] * .pi / 180)
+        s += (score - lo) * sin(beamAzimuths[k] * .pi / 180)
+    }
+    return atan2(s, c) * 180 / .pi
+}
+
+/// Which direction a classified sound came from. Confirmed: the heard direction nearest to where its beam scores
+/// point. Otherwise, in order: the same sound's last confirmed direction (`previous`, a siren doesn't jump), the
+/// beams' rough pointing, the only direction heard; nil = genuinely unclear (several sounds, no beam evidence).
+nonisolated func pickDirection(sources: [Double], beams: Double?, previous: Double?) -> (azimuth: Double, confirmed: Bool)? {
+    if let beams {
+        if let nearest = sources.min(by: { angularDistance($0, beams) < angularDistance($1, beams) }),
+           angularDistance(nearest, beams) <= 90 { return (nearest, true) }
+        return (previous ?? beams, false)
+    }
+    if let previous { return (previous, false) }
+    return sources.count == 1 ? (sources[0], false) : nil
+}
+
+nonisolated let sirenLabels: Set<String> = ["siren", "police_siren", "ambulance_siren", "fire_engine_siren",
+                                             "emergency_vehicle", "civil_defense_siren"]
+/// Sounds that last (sirens, reversing beeps, trains): confirmed over time before alerting.
+nonisolated let longSounds = sirenLabels.union(["reverse_beeps", "train_horn", "train_whistle"])
+
+/// Whether a sound's recent scores (best of the 5 listeners per window, per family, newest last) are convincing.
+/// Measured on siren-like non-sirens (singing, whistling, beeping, kettle) vs synthetic sirens and honks:
+/// - long sounds: ≥ 0.5 in 2 of the last 3 windows (no false sirens, all sirens caught within 0.5 s)
+/// - horns: one window ≥ 0.3 (short; nothing else was ever scored as a horn)
+/// - the rest (screams, skids, bells, barks, shouts): one window ≥ 0.7, or two in a row ≥ 0.5
+// ponytail: tuned on synthetic sounds; re-check with replay on real recordings
+/// The rule `convincing` applies to `label`, in words.
+nonisolated func confirmRule(_ label: String) -> String {
+    if horns.contains(label) { return "one window ≥ 0.30" }
+    if longSounds.contains(label) { return "≥ 0.50 in 2 of the last 3 windows" }
+    return "one window ≥ 0.70, or two in a row ≥ 0.50"
+}
+
+/// Why an alert sound got its level, in words (same rules as alertLevel).
+nonisolated func levelExplanation(_ label: String, azimuth: Double?, overUsual: Double?) -> String {
+    let vsUsual = overUsual.map { String(format: "%+.0f dB vs this street's usual", $0) } ?? "street level not learned yet"
+    let what = alertName(label).what
+    if let o = overUsual, o >= Detector.nearDB { return "near: \(vsUsual) ≥ +\(Int(Detector.nearDB)) → critical" }
+    if alwaysCritical.contains(label) { return "\(what) is always critical (\(vsUsual))" }
+    guard horns.contains(label) else { return "\(what) is a warning unless near (\(vsUsual), needs +\(Int(Detector.nearDB)))" }
+    guard let azimuth else { return "horn, direction unclear → assume critical" }
+    let s = slot(azimuth, of: sectorNames.count)
+    return Detector.warnSectors.contains(s) ? "horn \(sectorNames[s]), out of view → critical"
+        : "horn \(sectorNames[s]), in view and not near (\(vsUsual)) → warning"
+}
+
+nonisolated func convincing(_ label: String, _ trail: [Double]) -> Bool {
+    guard let now = trail.last else { return false }
+    if horns.contains(label) { return now >= alertThreshold }
+    if longSounds.contains(label) { return trail.suffix(3).filter { $0 >= 0.5 }.count >= 2 }
+    return now >= 0.7 || (trail.count >= 2 && now >= 0.5 && trail[trail.count - 2] >= 0.5)
+}
+
+/// One key per family (all siren variants share one score history).
+nonisolated func familyKey(_ label: String) -> String { family(of: label).sorted().first ?? label }
+
+/// Labels that are the same sound to a runner (the classifier flips between them from one half second to the next).
+nonisolated func family(of label: String) -> Set<String> {
+    sirenLabels.contains(label) ? sirenLabels : horns.contains(label) ? horns : [label]
+}
+
+/// What to call an alert sound: one name per family, so a siren doesn't flip between "Siren" and "Emergency vehicle".
+nonisolated func alertName(_ label: String) -> (what: String, short: String) {
+    if sirenLabels.contains(label) { return ("Siren", "Siren") }
+    if horns.contains(label) { return ("Horn", "Horn") }
+    return (pretty(label), shortLabel(label))
+}
+
+/// Which alert sound to report from one classifier window (best score per label across the all-around mic and the
+/// beams) and the last few windows' siren scores: critical kinds first, then the highest score.
+/// An ongoing sound (`current`, any label of its family) keeps priority over a new one of the same rank.
+nonisolated func pickAlert(_ best: [String: Double], trails: [String: [Double]], current: String? = nil) -> (label: String, score: Double)? {
+    let passing = best.filter { convincing($0.key, trails[familyKey($0.key)] ?? [$0.value]) }
+    func rank(_ label: String) -> Int { alwaysCritical.contains(label) ? 2 : horns.contains(label) ? 1 : 0 }
+    let ongoing = current.map(family(of:)) ?? []
+    func key(_ l: String, _ s: Double) -> (Int, Int, Double) { (rank(l), ongoing.contains(l) ? 1 : 0, s) }
+    return passing.max { key($0.key, $0.value) < key($1.key, $1.value) }.map { ($0.key, $0.value) }
+}
+
+/// Loudest overall level in [start, end), for judging whether a sound was near.
+nonisolated func peakDB(_ samples: [DirectionSample], from start: Double, to end: Double) -> Double? {
+    samples.filter { $0.t >= start && $0.t < end }.map(\.db).max()
 }
 
 /// Power-weighted circular mean direction of the samples in [start, end), and the peak strength there.
@@ -115,9 +318,85 @@ nonisolated func soundDirection(_ samples: [DirectionSample], from start: Double
     return c == 0 && s == 0 ? nil : (atan2(s, c) * 180 / .pi, peak)
 }
 
+/// Weighted circular mean of directions (degrees) and the weighted average distance from it (how much they scatter).
+nonisolated func circularMean(_ samples: [(deg: Double, weight: Double)]) -> (mean: Double, spread: Double)? {
+    var c = 0.0, s = 0.0, total = 0.0
+    for x in samples where x.weight > 0 {
+        c += x.weight * cos(x.deg * .pi / 180)
+        s += x.weight * sin(x.deg * .pi / 180)
+        total += x.weight
+    }
+    guard total > 0, c != 0 || s != 0 else { return nil }
+    let mean = atan2(s, c) * 180 / .pi
+    return (mean, samples.filter { $0.weight > 0 }.map { $0.weight * angularDistance($0.deg, mean) }.reduce(0, +) / total)
+}
+
+/// The fine-tune that best explains a direction test: the arrow measured with fine-tune off for sounds at known
+/// directions. Tries mirror off and on; leftover = average error after the fit (large = not a simple rotation:
+/// front/back mix-ups, echoes, or the body blocking). Needs 2 directions 90° apart to tell mirrored from not.
+nonisolated func fitFineTune(_ tests: [(truth: Double, measured: Double)]) -> (offset: Double, mirror: Bool, leftover: Double)? {
+    guard tests.count >= 2 else { return nil }
+    return [false, true].compactMap { mirror -> (offset: Double, mirror: Bool, leftover: Double)? in
+        // No offset at all when the candidates cancel out (this mirror setting fits nothing).
+        guard let offset = circularMean(tests.map { ((mirror ? -1 : 1) * -$0.measured + $0.truth, 1) })?.mean else { return nil }
+        let leftover = tests.map { angularDistance(calibrated($0.measured, offset: offset, mirror: mirror), $0.truth) }.reduce(0, +)
+        return (offset, mirror, leftover / Double(tests.count))
+    }.min { $0.leftover < $1.leftover }
+}
+
+/// Both values, or nil.
+nonisolated func zip2<A, B>(_ a: A?, _ b: B?) -> (A, B)? {
+    guard let a, let b else { return nil }
+    return (a, b)
+}
+
 /// Index of the slice an angle falls in when the circle is cut into `count` equal slices centred on 0°.
 nonisolated func slot(_ degrees: Double, of count: Int) -> Int {
     (Int((degrees / 360 * Double(count)).rounded()) % count + count) % count
+}
+
+nonisolated enum AlertLevel: Int, Comparable, Sendable {
+    case warning   // orange: worth knowing (horn ahead, bike bell, dog, shout, something getting closer, your name)
+    case critical  // red: act now (siren, horn from behind or the side, anything near, your danger words)
+    static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+}
+
+/// Urgent wherever they are and however loud.
+nonisolated let alwaysCritical: Set<String> = ["siren", "police_siren", "ambulance_siren", "fire_engine_siren", "emergency_vehicle",
+                                                "civil_defense_siren", "vehicle_skidding", "screaming", "train_horn", "train_whistle"]
+nonisolated let horns: Set<String> = ["car_horn", "air_horn", "foghorn"]
+
+/// How urgent a classifier alert sound is. Sirens, skidding, screams and trains are always critical. A horn is critical
+/// unless it's ahead of you (in view) and not near. Anything else (bike bell, reversing beeps, dog, shout) is a
+/// warning. Anything near is critical.
+nonisolated func alertLevel(_ label: String, azimuth: Double?, near: Bool) -> AlertLevel {
+    if near || alwaysCritical.contains(label) { return .critical }
+    guard horns.contains(label) else { return .warning }
+    guard let azimuth else { return .critical }  // can't tell where it is: assume the worst
+    return Detector.warnSectors.contains(slot(azimuth, of: sectorNames.count)) ? .critical : .warning
+}
+
+/// "car_horn" -> "Horn": one word for the compact Dynamic Island.
+nonisolated func shortLabel(_ id: String) -> String {
+    pretty(id.split(separator: "_").last.map(String.init) ?? id)
+}
+
+/// Danger words listened for until the user changes them (Alerts screen).
+nonisolated let defaultDangerWords = "watch out, look out, careful"
+
+/// Comma-separated user input -> phrases ("Vincent, Vince" -> ["Vincent", "Vince"]).
+nonisolated func phrases(_ list: String) -> [String] {
+    list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+}
+
+/// Which of `phrases` was said in `text`: whole words, ignoring case, accents and punctuation.
+nonisolated func matchedPhrase(in text: String, among phrases: [String]) -> String? {
+    func words(_ s: String) -> String {
+        " " + s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .split { !$0.isLetter && !$0.isNumber }.joined(separator: " ") + " "
+    }
+    let said = words(text)
+    return phrases.first { words($0).count > 2 && said.contains(words($0)) }
 }
 
 /// "behind on your left" etc., for the status card, notifications and the Dynamic Island.
@@ -126,6 +405,29 @@ nonisolated func directionWords(_ azimuth: Double?) -> String {
     let names = ["ahead", "ahead on your left", "on your left", "behind on your left",
                  "behind you", "behind on your right", "on your right", "ahead on your right"]
     return names[slot(azimuth, of: names.count)]
+}
+
+/// Seconds until an approaching sound reaches you, from how fast it gets louder: loudness falls 6 dB per doubling
+/// of distance, so something coming straight at you at a steady speed rises 8.7 / (seconds to reach) dB per second.
+/// Needs no calibration and no idea how loud the source is. Reads high for things passing beside you.
+nonisolated func secondsToReach(risingDBPerSecond rate: Double) -> Double? {
+    rate > 0.5 ? 20 / log(10) / rate : nil
+}
+
+/// Experimental: the direction most likely coming at you (stands out from the other directions and is getting
+/// louder) and how many seconds until it arrives. Looser than the "getting closer" warning, so it shows earlier.
+/// The rise is measured over the last second after 0.3 s smoothing, i.e. it describes ~0.8 s ago.
+nonisolated func reachEstimate(_ stats: [ApproachDetector.SectorStat]) -> (sector: Int, seconds: Double)? {
+    let rule = ApproachDetector()
+    let candidates = stats.indices.filter { stats[$0].lead >= rule.leadDB && stats[$0].db > rule.minDB && stats[$0].recentRise > 0.5 }
+    guard let s = candidates.max(by: { stats[$0].db < stats[$1].db }),
+          let secs = secondsToReach(risingDBPerSecond: stats[s].recentRise) else { return nil }
+    return (s, max(secs - 0.8, 0))
+}
+
+/// Distance from loudness alone, given the same sound's level at a known distance (6 dB quieter per doubling).
+nonisolated func metersFromLevel(_ db: Double, reference refDB: Double, at refMeters: Double) -> Double {
+    refMeters * pow(10, (refDB - db) / 20)
 }
 
 /// The 8 sectors of 45°, counter-clockwise from ahead (runner's frame, after fine-tune).
@@ -153,6 +455,7 @@ nonisolated struct ApproachDetector {
         var biggestJump: Double  // largest rise between two ticks
         var lead: Double         // now minus the median sector now
         var sweep: Double        // ≈ how fast the source's bearing is moving, °/s over the last second
+        var recentRise: Double   // dB gained in the last second
         var ledFor: Double       // seconds this sector has stood out from the others without a break
         var approaching: Bool
     }
@@ -174,7 +477,8 @@ nonisolated struct ApproachDetector {
             let back = Int(1 / tick)
             let sweep = abs(balance(history[n - 1]) - balance(history[n - 1 - back])) * 6
             let led = (0..<n).reversed().prefix { l[$0] - medians[$0] >= leadDB }.count
-            return SectorStat(db: l[n - 1], rise: rise, biggestJump: jump, lead: lead, sweep: sweep, ledFor: Double(led) * tick,
+            return SectorStat(db: l[n - 1], rise: rise, biggestJump: jump, lead: lead, sweep: sweep,
+                              recentRise: l[n - 1] - l[n - 1 - back], ledFor: Double(led) * tick,
                               approaching: l[n - 1] > minDB && rise >= riseDB && jump <= rise / 2 && lead >= leadDB)
         }
     }
@@ -251,6 +555,7 @@ nonisolated struct Block: Sendable {
     var duration: Double
     var format: String    // what iOS actually delivers, for the debug screen
     var savingAudio: Bool // the raw audio of this block went into the recording
+    var bins: [SIMD4<Float>] = []  // per-frequency intensity (phone frame) and power (binIntensities)
 }
 
 /// Turns one delivered buffer into a Block on the shared stream clock. Used by the live tap and the replay tool.
@@ -259,9 +564,12 @@ nonisolated struct BlockMaker {
     static let highPassHz = 200.0
     private var frames: AVAudioFramePosition = 0
     private var highPass: [HighPass] = []
+    private let spectrum = Spectrum()
 
-    /// The block (direction path high-passed), the unfiltered omni channel for the classifier, and the block's frame position.
-    mutating func make(_ buf: AVAudioPCMBuffer, savingAudio: Bool = false) -> (block: Block, omni: [Float], at: AVAudioFramePosition) {
+    /// The block (direction path high-passed), the unfiltered omni channel and beams (one per `steering` weight) for
+    /// the classifiers, and the block's frame position.
+    mutating func make(_ buf: AVAudioPCMBuffer, savingAudio: Bool = false, steering: [SIMD3<Float>] = [])
+        -> (block: Block, omni: [Float], beams: [[Float]], at: AVAudioFramePosition) {
         let format = buf.format, sr = format.sampleRate
         if highPass.isEmpty { highPass = (0..<4).compactMap { _ in HighPass(cutoff: Self.highPassHz, sampleRate: sr) } }
         let raw = (0..<4).map { samples(buf, channel: $0) }
@@ -270,10 +578,10 @@ nonisolated struct BlockMaker {
         let block = Block(reading: foaReading(w: ch[0], y: ch[1], z: ch[2], x: ch[3]),
                           start: Double(frames) / sr, duration: Double(buf.frameLength) / sr,
                           format: "\(Int(sr)) Hz · \(format.channelCount) ch · \(kind)\(format.isInterleaved ? " interleaved" : "") · \(buf.frameLength) frames",
-                          savingAudio: savingAudio)
+                          savingAudio: savingAudio, bins: binIntensities(ch, sampleRate: sr, spectrum: spectrum))
         let at = frames
         frames += AVAudioFramePosition(buf.frameLength)
-        return (block, raw[0], at)
+        return (block, raw[0], steering.map { beamSignal(raw, $0) }, at)
     }
 
     private func samples(_ buf: AVAudioPCMBuffer, channel c: Int) -> [Float] {
@@ -300,9 +608,11 @@ nonisolated struct Motion: Sendable {
 nonisolated struct Processed: Sendable {
     var block: Block
     var motion: Motion
-    var rawAzimuth: Double?   // from the phone's pose alone; nil when the pose has no "ahead"
+    var rawAzimuth: Double?   // this block, from the phone's pose alone; nil when the pose has no "ahead"
     var correction: Double    // arm-swing correction from the gyro, degrees
-    var azimuth: Double?      // after fine-tune + correction: what everything else uses
+    var blockAzimuth: Double? // this block after fine-tune + correction (jumpy: one 21 ms block)
+    var azimuth: Double?      // the arrow: blockAzimuth averaged over ~0.3 s; what everything else uses
+    var levelDB: Double       // overall level averaged over ~1 s (steadier than one block)
     var hum: Double?          // the street's background level (dB), once known
     var usual: Double?        // the street's usual level (dB), once known
     var loudness: Double      // 0…1: how far above the hum, over 24 dB
@@ -313,8 +623,29 @@ nonisolated struct Bin: Sendable { var strength = 0.0, kind = SoundKind.other }
 
 nonisolated struct Alert: Equatable, Sendable {
     var azimuth: Double?  // nil = heard it but direction unclear
-    var what: String
-    var isApproach = false  // "getting closer" rather than a horn/siren/bell/shout (picks the haptic pattern)
+    var what: String      // "Car horn", "Vehicle getting closer", "Someone called “Vincent”"
+    var level: AlertLevel
+    var short: String     // one word for the compact Dynamic Island: "Horn", "Siren", "Vehicle", "Name"
+}
+
+/// How the latest alert decision was reached (debug screen).
+nonisolated struct JudgedWindow: Sendable {
+    var label: String              // "" = nothing passed
+    var score: Double
+    var beamScores: [Double]       // that label's score per beam (ahead, left, behind, right); empty without beams
+    var sources: [Double]          // directions heard in that window
+    var beamPointing: Double?
+    var azimuth: Double?
+    var listeners: [ListenerScore] = []  // what each of the 5 listeners heard most (alert sounds only)
+    var directionReason = ""
+    var levelReason = ""
+}
+
+/// One listener's strongest alert sound in a window.
+nonisolated struct ListenerScore: Sendable {
+    var name: String   // "All-around", "Beam left", …
+    var label: String  // "" = no alert sound at all
+    var score: Double
 }
 
 /// Everything the debug screen shows, refreshed 10×/s so numbers stay readable.
@@ -325,6 +656,9 @@ nonisolated struct DebugSnapshot: Sendable {
     var heldBack: [Int: String]  // approaching sectors not warned, by reason (view, usual, settling, passing, kind)
     var heard: Heard?
     var heardLatency: Double
+    var lastJudged: JudgedWindow?
+    var histogram: [Double]          // sourceHistogram of the last half second
+    var trails: [String: [Double]]   // per sound family: best score of the last 3 windows (recently heard ones)
     var events: [String]
     var alert: Alert?
     var kind: SoundKind
@@ -340,6 +674,11 @@ nonisolated struct Detector {
     // °/s: bearing moving faster than this while it gets louder = passing by, not coming at you. Bearing rate is
     // speed × side-offset ÷ distance²: at 6 m, a vehicle on your line (≤1 m off) moves ~13°/s, a road car 4 m off ~40°/s.
     static let maxSweep = 20.0
+    // ponytail: guess; "near" = this much louder than the street usually is. Tune with replay on real recordings.
+    static let nearDB = 15.0
+    // The arrow averages this long: 3–6× steadier than single blocks in street noise (synthetic benchmark), still
+    // follows a moving sound. Longer = steadier but laggier.
+    static let arrowSeconds = 0.3
 
     var offset = 0.0, mirror = false  // the user's fine-tune
     var bins = [Bin](repeating: Bin(), count: 72)  // 5° per spoke
@@ -356,8 +695,18 @@ nonisolated struct Detector {
     private var approach = ApproachDetector()
     private var heldBack: [Int: String] = [:]   // why each approaching sector isn't warned, to log only changes
     private var levels = LevelHistory()
+    private var levelPower = 0.0  // ~1 s running average of W power
     private var heading = HeadingSmoother()
-    private var recent: [DirectionSample] = []  // last few seconds, for the classifier's late verdicts
+    private var arrow = SIMD2<Double>.zero  // runner frame (x ahead, y left), length = directional power, ~0.3 s average
+    private var recent: [DirectionSample] = []  // last few seconds, for the classifier's and transcriber's late results
+    private var lastWords: [String: Double] = [:]  // phrase -> when it last raised an alert
+    private var windows: [Int: (omni: Heard?, beams: [Int: Heard])] = [:]  // classifier answers by window start (ms)
+    private var scoreTrails: [String: [Double]] = [:]  // per family: best score of the last 3 windows
+    private var lastFix: (label: String, azimuth: Double, at: Double)?  // last confirmed direction of an alert sound
+    private var currentLabel: String?             // classifier label of the alert being shown
+    private var lastJudged: JudgedWindow?
+    /// Ambisonic weights (front, left, up) aiming the 4 classifier beams; follows the phone's pose and arm swing.
+    private(set) var beamWeights: [SIMD3<Float>] = beamAzimuths.map { SIMD3(Float(cos($0 * .pi / 180)), Float(sin($0 * .pi / 180)), 0) }
     private var mics = [Double](repeating: -120, count: phoneSides.count)
     private var alertUntil = -Double.infinity
     private var lastPulse = -Double.infinity
@@ -371,7 +720,10 @@ nonisolated struct Detector {
 
     func snapshot() -> DebugSnapshot? {
         last.map { DebugSnapshot(processed: $0, mics: mics, sectors: approach.stats(), heldBack: heldBack, heard: heard,
-                                 heardLatency: heardLatency, events: events, alert: alert, kind: kind) }
+                                 heardLatency: heardLatency, lastJudged: lastJudged,
+                                 histogram: sourceHistogram(recent, from: clock - 0.5, to: clock + 1),
+                                 trails: scoreTrails.filter { ($0.value.max() ?? 0) >= 0.1 },
+                                 events: events, alert: alert, kind: kind) }
     }
 
     mutating func clearPendingLog() { pendingLog = [] }
@@ -389,25 +741,98 @@ nonisolated struct Detector {
         pendingLog.append(line)
     }
 
+    /// One classifier answer: from the all-around mic (h.beam == nil) or one of the 4 beams. The 5 answers for the
+    /// same half second are judged together, as soon as all are in (or a newer window overtakes a straggler).
     mutating func hear(_ h: Heard) {
-        heard = h
-        heardLatency = clock - h.end
-        if h.kind != kind { log("classifier: \(h.kind)\(h.label.isEmpty ? "" : " (\(pretty(h.label)))")") }
-        kind = h.kind
-        label = pretty(h.label)
-        guard h.kind == .alert else { return }
-        // The verdict lands ~0.5 s after the sound (a short honk is already over), so take the direction
-        // from the exact slice of audio the classifier judged, and paint it on the radar in red.
-        // ponytail: assumes the alert is the loudest thing in that half second; per-source needs beamforming
-        let found = soundDirection(recent, from: h.start, to: h.end)
-        if let found {
-            let center = slot(found.azimuth, of: bins.count)
-            for d in -2...2 {
-                let j = (center + d + bins.count) % bins.count
-                bins[j] = Bin(strength: max(bins[j].strength, found.peak * (1 - 0.2 * Double(abs(d)))), kind: .alert)
+        if h.beam == nil {
+            heard = h
+            heardLatency = clock - h.end
+            if h.kind != kind { log("classifier: \(h.kind)\(h.label.isEmpty ? "" : " (\(pretty(h.label)))")") }
+            kind = h.kind
+            label = pretty(h.label)
+        }
+        let key = Int((h.start * 1000).rounded())
+        var w = windows[key] ?? (omni: nil, beams: [:])
+        if let b = h.beam { w.beams[b] = h } else { w.omni = h }
+        windows[key] = w
+        for k in windows.keys.sorted() {
+            guard let w = windows[k] else { continue }
+            if (w.omni != nil && w.beams.count == beamAzimuths.count) || key - k >= 400 {
+                windows[k] = nil
+                judge(w.omni, w.beams)
             }
         }
-        warn(Alert(azimuth: found?.azimuth, what: label))
+    }
+
+    /// Decide whether a window holds an alert sound and where it came from. Critical sounds win over louder or
+    /// higher-scoring warnings; the direction is that sound's own, not the loudest thing's.
+    private mutating func judge(_ omni: Heard?, _ beams: [Int: Heard]) {
+        let all = (omni.map { [$0] } ?? []) + Array(beams.values)
+        guard let start = all.first?.start, let end = all.first?.end else { return }
+        var best: [String: Double] = [:]
+        for h in all { for (l, s) in h.alertScores { best[l] = max(best[l] ?? 0, s) } }
+        var familyBest: [String: Double] = [:]
+        for (l, v) in best { familyBest[familyKey(l)] = max(familyBest[familyKey(l)] ?? 0, v) }
+        for k in Set(scoreTrails.keys).union(familyBest.keys) {
+            scoreTrails[k] = Array(((scoreTrails[k] ?? []) + [familyBest[k] ?? 0]).suffix(3))
+        }
+        var listeners: [ListenerScore] = []
+        for (name, h) in [("All-around", omni)] + beamAzimuths.indices.map({ ("Beam \(beamNames[$0])", beams[$0]) }) {
+            guard let h else { continue }
+            let top = h.alertScores.max { $0.value < $1.value }
+            listeners.append(ListenerScore(name: name, label: top?.key ?? "", score: top?.value ?? 0))
+        }
+        let ongoing = alert != nil && clock <= alertUntil ? currentLabel : nil
+        guard let pick = pickAlert(best, trails: scoreTrails, current: ongoing) else {
+            lastJudged = JudgedWindow(label: "", score: best.values.max() ?? 0, beamScores: [], sources: [], beamPointing: nil,
+                                      azimuth: nil, listeners: listeners)
+            return
+        }
+        // The verdict lands ~0.5 s after the sound, so look back at the exact half second it judged.
+        let fam = family(of: pick.label)
+        let beamScores = beams.count == beamAzimuths.count
+            ? beamAzimuths.indices.map { k in fam.map { beams[k]?.alertScores[$0] ?? 0 }.max() ?? 0 } : []
+        let sources = soundSources(recent, from: start, to: end), pointing = beamEstimate(beamScores)
+        let previous = lastFix.flatMap { fam.contains($0.label) && clock - $0.at < 3 ? $0.azimuth : nil }
+        let picked = pickDirection(sources: sources, beams: pointing, previous: previous)
+        // Confirmed, or the remembered one reused: keep it alive while the same sound goes on.
+        if let picked, picked.confirmed || picked.azimuth == previous { lastFix = (pick.label, picked.azimuth, clock) }
+        let azimuth = picked?.azimuth
+        currentLabel = pick.label
+        let directionReason = switch picked {
+        case nil: "unclear: several sounds heard and the beams give no evidence"
+        case let p? where p.confirmed: "the heard direction nearest to where the beams point"
+        case let p? where p.azimuth == previous: "kept: this sound's last confirmed direction"
+        case _ where pointing != nil: "the beams' rough pointing (no heard direction within 90°)"
+        default: "the only direction heard"
+        }
+        let overUsual = zip2(peakDB(recent, from: start, to: end), levels.usual).map { $0 - $1 }
+        lastJudged = JudgedWindow(label: pick.label, score: pick.score, beamScores: beamScores, sources: sources,
+                                  beamPointing: pointing, azimuth: azimuth, listeners: listeners, directionReason: directionReason,
+                                  levelReason: levelExplanation(pick.label, azimuth: azimuth, overUsual: overUsual))
+        let name = alertName(pick.label)
+        if kind != .alert { log("classifier: alert (\(name.what), heard over \(kind))") }
+        kind = .alert
+        label = name.what
+        if let azimuth {
+            let center = slot(azimuth, of: bins.count), peak = soundDirection(recent, from: start, to: end)?.peak ?? 0.5
+            for d in -2...2 {
+                let j = (center + d + bins.count) % bins.count
+                bins[j] = Bin(strength: max(bins[j].strength, peak * (1 - 0.2 * Double(abs(d)))), kind: .alert)
+            }
+        }
+        let near = (overUsual ?? -.infinity) >= Self.nearDB
+        warn(Alert(azimuth: azimuth, what: name.what, level: alertLevel(pick.label, azimuth: azimuth, near: near), short: name.short))
+    }
+
+    /// Someone said the user's name (warning) or one of their danger words (critical); [start, end) is when, in
+    /// stream seconds, so the direction comes from that audio. Once per phrase per 5 s: live transcripts repeat.
+    mutating func heardWords(_ phrase: String, isName: Bool, from start: Double, to end: Double) {
+        if let t = lastWords[phrase], clock - t < 5 { return }
+        lastWords[phrase] = clock
+        let found = soundDirection(recent, from: start, to: max(end, start + 0.5))
+        warn(Alert(azimuth: found?.azimuth, what: isName ? "Someone called “\(phrase)”" : "Someone said “\(phrase)”",
+                   level: isName ? .warning : .critical, short: isName ? "Name" : pretty(phrase)))
     }
 
     @discardableResult
@@ -420,16 +845,34 @@ nonisolated struct Detector {
 
         // "Ahead" from gravity on every block (works upright, tilted or flat), then the gyro takes out arm swing.
         let correction = heading.update(yawRate: m.yawRate, dt: b.duration)
-        let raw = runnerAzimuth(r.phoneVector, gravity: m.gravity)
-        let az = raw.map { remainder(calibrated($0, offset: offset, mirror: mirror) + correction, 360) }
+        let axes = groundAxes(gravity: m.gravity)
+        let raw = axes.map { atan2(simd_dot(r.phoneVector, $0.left), simd_dot(r.phoneVector, $0.ahead)) * 180 / .pi }
+        let blockAz = raw.map { remainder(calibrated($0, offset: offset, mirror: mirror) + correction, 360) }
+        // The arrow: each block's direction weighted by how loud and directional it is, averaged in the runner's frame
+        // (arm swing already taken out, so it doesn't blur). One 21 ms block alone jitters with street noise.
+        var az: Double?
+        if let blockAz, let axes {
+            let v = r.phoneVector, a = blockAz * .pi / 180
+            let length = (pow(simd_dot(v, axes.ahead), 2) + pow(simd_dot(v, axes.left), 2)).squareRoot()
+            arrow += (SIMD2(length * cos(a), length * sin(a)) - arrow) * min(b.duration / Self.arrowSeconds, 1)
+            az = atan2(arrow.y, arrow.x) * 180 / .pi
+        }
         // Lines measure how far a sound stands out above this street's hum, not raw loudness.
         levels.add(r.db, at: b.start)
+        levelPower += (r.ww - levelPower) * min(b.duration, 1)
         let loudness = min(max((r.db - (levels.hum ?? r.db)) / 24, 0), 1)
         let strength = az == nil ? 0 : loudness * r.directness
 
-        if let az {
-            recent.append(DirectionSample(t: b.start, azimuth: az, power: r.ww * r.directness, strength: strength))
-            recent.removeAll { $0.t < b.start - 4 }
+        if let az, let axes {
+            // Each frequency's own direction in the runner's frame, so simultaneous sounds stay apart (soundSources).
+            let spec = b.bins.map { v -> SIMD3<Float> in
+                let p = SIMD3<Double>(Double(v.x), Double(v.y), Double(v.z)), ahead = simd_dot(p, axes.ahead), left = simd_dot(p, axes.left)
+                let a = (calibrated(atan2(left, ahead) * 180 / .pi, offset: offset, mirror: mirror) + correction) * .pi / 180
+                let length = (ahead * ahead + left * left).squareRoot()
+                return SIMD3(Float(length * cos(a)), Float(length * sin(a)), v.w)
+            }
+            recent.append(DirectionSample(t: b.start, azimuth: az, power: r.ww * r.directness, strength: strength, db: r.db, spec: spec))
+            recent.removeAll { $0.t < b.start - 8 }
             let center = slot(az, of: bins.count)
             for (d, k) in [(0, 1.0), (-1, 0.5), (1, 0.5)] {
                 let j = (center + d + bins.count) % bins.count
@@ -437,16 +880,22 @@ nonisolated struct Detector {
             }
         }
         // Horns and sirens are raised in hear(); here only "something is getting closer".
-        if let axes = groundAxes(gravity: m.gravity) {
-            let beams = (0..<ApproachDetector.sectors).map { k -> Double in
-                let onPhone = Double(k) * 360 / Double(ApproachDetector.sectors) - correction - offset  // undo correction + fine-tune
-                let deg = (mirror ? -onPhone : onPhone) * .pi / 180
-                return r.beamPower(toward: cos(deg) * axes.ahead + sin(deg) * axes.left)
+        if let axes {
+            /// A runner-frame direction as a phone-frame unit vector (undoing arm-swing correction and fine-tune).
+            func onPhone(_ azimuth: Double) -> SIMD3<Double> {
+                let a = azimuth - correction - offset, deg = (mirror ? -a : a) * .pi / 180
+                return cos(deg) * axes.ahead + sin(deg) * axes.left
             }
+            let beams = (0..<ApproachDetector.sectors).map { r.beamPower(toward: onPhone(Double($0) * 360 / Double(ApproachDetector.sectors))) }
             if let rising = approach.update(sectorPower: beams, dt: b.duration) { judgeApproach(rising) }
+            beamWeights = beamAzimuths.map { u in
+                let p = onPhone(u)
+                return SIMD3(Float(simd_dot(p, foaFront)), Float(simd_dot(p, foaLeft)), Float(simd_dot(p, foaUp)))
+            }
         }
-        let p = Processed(block: b, motion: m, rawAzimuth: raw, correction: correction, azimuth: az,
-                          hum: levels.hum, usual: levels.usual, loudness: loudness, strength: strength)
+        let p = Processed(block: b, motion: m, rawAzimuth: raw, correction: correction, blockAzimuth: blockAz, azimuth: az,
+                          levelDB: 10 * log10(max(levelPower, 1e-12)), hum: levels.hum, usual: levels.usual,
+                          loudness: loudness, strength: strength)
         last = p
         return p
     }
@@ -479,15 +928,21 @@ nonisolated struct Detector {
         }
         heldBack = now
         guard let s = rising.first(where: { holdBack($0) == nil }) else { return }
+        let near = usual.map { stats[s].db - $0 >= Self.nearDB } ?? false
         warn(Alert(azimuth: Double(s) * 360 / Double(ApproachDetector.sectors),
-                   what: kind == .traffic ? "Vehicle getting closer" : "Sound getting closer", isApproach: true))
+                   what: kind == .traffic ? "Vehicle getting closer" : "Sound getting closer",
+                   level: near ? .critical : .warning, short: kind == .traffic ? "Vehicle" : "Sound"))
     }
 
     private mutating func warn(_ a: Alert) {
-        if alert?.what != a.what { log("WATCH OUT: \(a.what) at \(a.azimuth.map { "\(Int($0.rounded()))°" } ?? "unknown direction")") }
+        if let current = alert, current.level > a.level, clock <= alertUntil { return }  // a warning never hides a critical
+        if alert?.what != a.what || alert?.level != a.level {
+            log("\(a.level == .critical ? "CRITICAL" : "WARNING"): \(a.what) at \(a.azimuth.map { "\(Int($0.rounded()))°" } ?? "unknown direction")")
+        }
+        let isNew = alert == nil || alert?.what != a.what || alert?.level != a.level
         alert = a
         alertUntil = clock + 3
-        if clock - lastPulse > 1.5 {
+        if (isNew && clock - lastPulse > 1.5) || clock - lastPulse > 10 {
             alertPulse += 1
             lastPulse = clock
         }
@@ -495,6 +950,69 @@ nonisolated struct Detector {
 }
 
 nonisolated func selfCheck() {
+    // Levels: sirens always critical; horns critical unless ahead and not near; bells, dogs, shouts are warnings until near.
+    precondition(alertLevel("police_siren", azimuth: 0, near: false) == .critical, "siren ahead, far")
+    precondition(alertLevel("car_horn", azimuth: 180, near: false) == .critical, "horn behind")
+    precondition(alertLevel("car_horn", azimuth: 90, near: false) == .critical, "horn on the left")
+    precondition(alertLevel("car_horn", azimuth: 10, near: false) == .warning, "horn ahead, far")
+    precondition(alertLevel("car_horn", azimuth: 10, near: true) == .critical, "horn ahead, near")
+    precondition(alertLevel("car_horn", azimuth: nil, near: false) == .critical, "horn, direction unknown")
+    precondition(alertLevel("dog_bark", azimuth: 180, near: false) == .warning, "dog, far")
+    precondition(alertLevel("dog_bark", azimuth: 0, near: true) == .critical, "dog, near")
+    precondition(shortLabel("police_siren") == "Siren" && shortLabel("shout") == "Shout")
+    for (label, az, over) in [("car_horn", 10.0, 3.0), ("car_horn", 180.0, 3.0), ("dog_bark", 0.0, 20.0), ("dog_bark", 0.0, 2.0), ("siren", 0.0, 0.0)] {
+        let says = levelExplanation(label, azimuth: az, overUsual: over), level = alertLevel(label, azimuth: az, near: over >= Detector.nearDB)
+        precondition(says.contains("critical") == (level == .critical) || says.contains("always critical"), "explanation disagrees: \(says)")
+    }
+    // Sources: a siren and people talking at once are two directions, not one in between.
+    func voice(_ deg: Double, _ k: Int, _ n: Int) -> [SIMD3<Float>] {  // n frequencies, the k-th dominated by a source at deg
+        (0..<n).map { i in i % 2 == k ? SIMD3(Float(cos(deg * .pi / 180)), Float(sin(deg * .pi / 180)), 1) : SIMD3(0, 0, 0.01) }
+    }
+    let both = (0..<20).map { t in DirectionSample(t: Double(t) * 0.02, azimuth: 0, power: 1, strength: 1,
+                                                   spec: zip(voice(90, 0, 80), voice(-45, 1, 80)).map { $0 + $1 }) }
+    let heard = soundSources(both, from: 0, to: 1)
+    precondition(heard.count == 2 && heard.contains { angularDistance($0, 90) < 6 } && heard.contains { angularDistance($0, -45) < 6 },
+                 "siren left + chatter ahead-right -> \(heard)")
+    // Direction: beams pointing behind-left pick the left source over the ahead-right one.
+    precondition(abs(beamEstimate([0.05, 0.76, 0.56, 0.06])! - 124) < 5, "beam pointing")
+    precondition(pickDirection(sources: [-45, 90], beams: 124, previous: nil)! == (90, true), "nearest heard direction")
+    precondition(beamEstimate([0.30, 0.29, 0.14, 0.11]) == nil, "beams barely disagree: no evidence")
+    precondition(beamEstimate([0.62, 0.50, 0.77, 0.57]) == nil, "every beam hears it clearly: no evidence")
+    precondition(pickDirection(sources: [-45, 90], beams: nil, previous: nil) == nil, "two sounds, no evidence: unclear")
+    precondition(pickDirection(sources: [-45], beams: 124, previous: 88)! == (88, false), "keeps the last confirmed direction")
+    precondition(pickDirection(sources: [90], beams: nil, previous: nil)! == (90, false), "only one thing heard")
+    // Priority and confirmation: critical first; one siren-like moment isn't a siren; a honk counts at once.
+    let sk = familyKey("siren")
+    precondition(pickAlert(["dog_bark": 0.9, "police_siren": 0.6], trails: [familyKey("dog_bark"): [0.9, 0.9], sk: [0.6, 0.6]])!.label == "police_siren",
+                 "siren beats louder dog")
+    precondition(pickAlert(["siren": 0.9], trails: [sk: [0.1, 0.9]]) == nil, "one siren-like moment isn't a siren")
+    precondition(pickAlert(["siren": 0.6], trails: [sk: [0.6, 0.2, 0.6]]) != nil, "2 of the last 3 is")
+    precondition(pickAlert(["car_horn": 0.35], trails: [familyKey("car_horn"): [0.35]]) != nil, "a short honk counts at once")
+    precondition(pickAlert(["dog_bark": 0.6], trails: [familyKey("dog_bark"): [0.1, 0.6]]) == nil, "a single 0.6 bark: not yet")
+    precondition(pickAlert(["screaming": 0.8, "emergency_vehicle": 0.6], trails: [familyKey("screaming"): [0.8], sk: [0.6, 0.6]],
+                           current: "police_siren")!.label == "emergency_vehicle", "ongoing siren keeps priority")
+    precondition(alertName("emergency_vehicle").what == "Siren" && alertName("air_horn").short == "Horn", "one name per family")
+
+    // Words: whole words, any case, accents and punctuation ignored.
+    precondition(matchedPhrase(in: "Hey VINCENT, watch... out!", among: ["Vincent"]) == "Vincent")
+    precondition(matchedPhrase(in: "Hey VINCENT, watch... out!", among: ["watch out"]) == "watch out")
+    precondition(matchedPhrase(in: "Vincentius is here", among: ["Vincent"]) == nil, "part of a longer word")
+    precondition(matchedPhrase(in: "José!", among: ["jose"]) == "jose")
+    precondition(phrases(" Vincent , Vince,, ") == ["Vincent", "Vince"])
+    // A warning (dog) never hides a critical (siren) that's still showing; a new critical replaces a warning.
+    var d = Detector()
+    d.heardWords("watch out", isName: false, from: 0, to: 0.5)
+    d.heardWords("Vincent", isName: true, from: 0, to: 0.5)
+    precondition(d.alert?.level == .critical && d.alert?.short == "Watch out", "name must not hide 'watch out'")
+    d.heardWords("watch out", isName: false, from: 1, to: 1.5)
+    precondition(d.alert?.what == "Someone said “watch out”", "same words within 5 s: no repeat")
+
+    // Something 30 m away closing at 10 m/s reaches you in 3 s: measure its rise over a tenth of a second.
+    let rise = 20 * log10(30.5 / 29.5) / 0.1
+    precondition(abs(secondsToReach(risingDBPerSecond: rise)! - 3) < 0.05, "30 m at 10 m/s -> \(secondsToReach(risingDBPerSecond: rise)!) s")
+    precondition(secondsToReach(risingDBPerSecond: 0) == nil, "not getting louder -> no estimate")
+    precondition(abs(metersFromLevel(-42, reference: -30, at: 1) - 3.98) < 0.01, "12 dB quieter = 4x as far")
+
     let s = (0..<4800).map { Float(sin(Double($0) * 0.3)) }, zero = s.map { _ in Float(0) }
     let upright = SIMD3<Double>(0, -1, 0), flat = SIMD3<Double>(0, 0, -1), tilted = SIMD3<Double>(0, -0.707, -0.707)
     for deg in [0.0, 45, 90, 180, -90] {
@@ -592,6 +1110,34 @@ nonisolated func selfCheck() {
     var turned = HeadingSmoother(), correction = 0.0
     for k in 0..<450 { correction = turned.update(yawRate: k < 50 ? .pi / 2 : 0, dt: 0.02) }  // turn left 90° in 1 s, then hold 8 s
     precondition(abs(correction) < 5, "a real turn should become the new ahead -> \(correction)°")
+
+    // A car closing at 10 m/s from behind, through street hum: "reaches you in" lands within half a second at 2 s out.
+    var car = Detector(), reach: Double?
+    for k in 0..<500 {  // until it's 20 m away, 2 s before it reaches you
+        let t = Double(k) * 0.02, r = 120 - 10 * t
+        car.add(Block(reading: plane(10 * log10(1e-2 / (r * r)), from: 180, bed: -55), start: t, duration: 0.02, format: "", savingAudio: false),
+                motion: Motion())
+        reach = reachEstimate(car.snapshot()!.sectors)?.seconds
+    }
+    precondition(abs((reach ?? .infinity) - 2) < 0.5, "car 2 s away -> \(reach.map { "\($0)" } ?? "nothing") s")
+
+    // The arrow: steadier than single blocks in noise, yet follows a sound that moves.
+    var steadyDetector = Detector(), blockErrors: [Double] = [], arrowErrors: [Double] = []
+    for k in 0..<300 {
+        let t = Double(k) * 0.02, truth = t < 4 ? 120.0 : 30.0, wobble = 0.6 * sin(Double(k) * 2.39), wobble2 = 0.6 * cos(Double(k) * 1.71)
+        var r = plane(-40, from: truth, bed: -40)
+        r.wx += 1e-4 * wobble; r.wy += 1e-4 * wobble2  // street noise: each block's direction jitters
+        let p = steadyDetector.add(Block(reading: r, start: t, duration: 0.02, format: "", savingAudio: false), motion: Motion())
+        if t > 1 && t < 4 { blockErrors.append(angularDistance(p.blockAzimuth!, truth)); arrowErrors.append(angularDistance(p.azimuth!, truth)) }
+        if t > 5 { precondition(angularDistance(p.azimuth!, truth) < 5, "arrow should follow a moved sound within 1 s -> \(p.azimuth!)") }
+    }
+    precondition(arrowErrors.max()! < blockErrors.max()! / 2, "arrow not steadier: \(arrowErrors.max()!) vs \(blockErrors.max()!)")
+    // Direction test: a phone that reads everything mirrored and 20° off is recovered.
+    let fit = fitFineTune([(0, 20), (90, -70), (180, -160)])!
+    precondition(fit.mirror && angularDistance(fit.offset, 20) < 0.5 && fit.leftover < 0.5, "fine-tune fit -> \(fit)")
+    precondition(fitFineTune([(90, 90)]) == nil, "one direction can't tell a rotation from a mirror")
+    let mirrored = fitFineTune([(0, -22), (90, -112)])!  // unmirrored candidates cancel exactly
+    precondition(mirrored.mirror && angularDistance(mirrored.offset, -22) < 0.5, "mirrored phone -> \(mirrored)")
 
     precondition(classify(["car_horn": 0.35, "speech": 0.9]).kind == .alert, "alerts beat louder chatter")
     precondition(classify(["speech": 0.8, "traffic_noise": 0.5]) == (.people, "speech"))
