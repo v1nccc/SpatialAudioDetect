@@ -105,7 +105,7 @@ struct PipelineView: View {
 
     @ViewBuilder private func whatSteps(_ d: DebugSnapshot) -> some View {
         let j = d.lastJudged
-        step("⑧ Five listeners", "Apple's sound classifier hears each half second through the all-around channel and 4 beams aimed ahead, left, behind and right of you (they follow the phone's pose). A beam aimed away from other noise hears a siren more clearly. Strongest alert sound per listener:") {
+        step("⑧ Five listeners", "\(radar.engine == .apple ? "Apple's sound classifier" : "Apple's sound classifier, through the SoundML package,") hears each half second through the all-around channel and 4 beams aimed ahead, left, behind and right of you (they follow the phone's pose). A beam aimed away from other noise hears a siren more clearly. Strongest alert sound per listener:") {
             if let ls = j?.listeners, !ls.isEmpty {
                 meters(ls.map { l in
                     ("\(l.name): \(l.label.isEmpty ? "nothing alert-like" : alertName(l.label).what)", l.score, f(l.score),

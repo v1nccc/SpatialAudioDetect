@@ -16,6 +16,7 @@ struct DebugView: View {
         NavigationStack {
             Form {
                 recordSection
+                soundModelSection
                 if let d = radar.debug {
                     inputSection(d)
                     channelSection(d)
@@ -58,6 +59,19 @@ struct DebugView: View {
             }
         } footer: {
             Text("Saves the raw 4-channel audio plus every number on this screen, block by block (up to ~46 MB per minute). Also in Files › On My iPhone › SpatialAudioDetect › Recordings.")
+        }
+    }
+
+    private var soundModelSection: some View {
+        Section {
+            Picker("Sound model", selection: Binding(get: { radar.engine }, set: { radar.engine = $0 })) {
+                ForEach(SoundEngine.allCases, id: \.self) { Text($0.rawValue) }
+            }
+            .pickerStyle(.segmented)
+        } header: {
+            Text("Sound model")
+        } footer: {
+            Text("Apple direct: Apple's built-in sound classifier, exact timing and every score. SoundML: the same Apple model through the SoundML package; it only reports sounds over their threshold and its timing is estimated. Switch any time, even while listening; the decisions log notes each switch, so recordings say which was used.")
         }
     }
 
@@ -166,7 +180,7 @@ struct DebugView: View {
         } header: {
             Text("⑥ Sound classifier (all-around + 4 beams, 0.5 s windows)")
         } footer: {
-            Text("Apple's raw top guesses (all-around mic); several can be high at once. Bar colour = the app's category (red alert, orange traffic, blue people, grey ignored). Alerts need confirming: sirens and other lasting sounds ≥ 0.5 in 2 of the last 3 windows, horns ≥ \(f(alertThreshold)) once, others ≥ 0.7 once or ≥ 0.5 twice in a row (best of the 5 listeners). Critical sounds win over louder warnings. Direction: each frequency's own direction gives the separate sounds heard; the beam that hears the alert best tells which of them it is.")
+            Text("\(radar.engine == .apple ? "Apple's raw top guesses" : "Sounds over their threshold (SoundML)") (all-around mic); several can be high at once. Bar colour = the app's category (red alert, orange traffic, blue people, grey ignored). Alerts need confirming: sirens and other lasting sounds ≥ 0.5 in 2 of the last 3 windows, horns ≥ \(f(alertThreshold)) once, others ≥ 0.7 once or ≥ 0.5 twice in a row (best of the 5 listeners). Critical sounds win over louder warnings. Direction: each frequency's own direction gives the separate sounds heard; the beam that hears the alert best tells which of them it is.")
         }
     }
 
