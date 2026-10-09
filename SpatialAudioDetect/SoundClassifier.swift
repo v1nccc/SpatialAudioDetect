@@ -42,6 +42,29 @@ nonisolated struct Heard: Sendable {
     var alertScores: [String: Double] { alerts.isEmpty && kind == .alert ? [label: alertScore] : alerts }
 }
 
+nonisolated extension Heard {
+    /// A verdict from label -> confidence scores (only labels the classifier reported).
+    init(scores: [String: Double], start: Double, end: Double, top: [(id: String, confidence: Double)], beam: Int?) {
+        let (kind, label) = classify(scores), alerts = scores.filter { soundKinds[$0.key] == .alert }
+        self.init(kind: kind, label: label, alertScore: alerts.values.max() ?? 0, start: start, end: end, top: top, beam: beam, alerts: alerts)
+    }
+}
+
+/// One listener (the all-around mic or a beam) turning audio into verdicts: Apple's classifier directly
+/// (SoundClassifier), or through the SoundML package (SoundMLListener), switchable in Debug to compare.
+nonisolated protocol SoundListener: AnyObject, Sendable {
+    var onResult: (@Sendable (Heard) -> Void)? { get set }
+    var droppedBlocks: Int { get }
+    /// Call from one serial queue (the capture queue). `at` = frames since capture start.
+    func feed(_ samples: [Float], sampleRate: Double, at: AVAudioFramePosition)
+    /// Start a fresh stream with the next feed (after being switched back in). Same queue as feed.
+    func reset()
+}
+
+nonisolated enum SoundEngine: String, CaseIterable, Sendable {
+    case apple = "Apple direct", soundML = "SoundML"
+}
+
 /// "car_horn" -> "Car horn"
 nonisolated func pretty(_ id: String) -> String {
     let s = id.replacingOccurrences(of: "_", with: " ")
@@ -49,7 +72,7 @@ nonisolated func pretty(_ id: String) -> String {
 }
 
 /// Runs Apple's sound classifier on one signal (the all-around mic or one beam); a verdict every 0.25 s.
-nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecked Sendable {
+nonisolated final class SoundClassifier: NSObject, SNResultsObserving, SoundListener, @unchecked Sendable {
     let beam: Int?
     var onResult: (@Sendable (Heard) -> Void)?
     private var analyzer: SNAudioStreamAnalyzer?
@@ -68,7 +91,8 @@ nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecke
     /// Blocks skipped because the phone couldn't keep up (live only).
     var droppedBlocks: Int { lock.withLock { dropped } }
 
-    /// Call from one serial queue (the capture queue). `at` = frames since capture start.
+    func reset() { analyzer = nil }
+
     func feed(_ samples: [Float], sampleRate: Double, at: AVAudioFramePosition) {
         if analyzer == nil, let f = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
            let request = try? SNClassifySoundRequest(classifierIdentifier: .version1) {
@@ -102,10 +126,7 @@ nonisolated final class SoundClassifier: NSObject, SNResultsObserving, @unchecke
     func request(_ request: SNRequest, didProduce result: SNResult) {
         guard let r = result as? SNClassificationResult else { return }
         let scores = Dictionary(r.classifications.map { ($0.identifier, $0.confidence) }, uniquingKeysWith: max)
-        let (kind, label) = classify(scores)
-        onResult?(Heard(kind: kind, label: label, alertScore: scores.filter { soundKinds[$0.key] == .alert }.values.max() ?? 0,
-                        start: r.timeRange.start.seconds, end: r.timeRange.end.seconds,
-                        top: r.classifications.prefix(6).map { ($0.identifier, $0.confidence) }, beam: beam,
-                        alerts: scores.filter { soundKinds[$0.key] == .alert }))
+        onResult?(Heard(scores: scores, start: r.timeRange.start.seconds, end: r.timeRange.end.seconds,
+                        top: r.classifications.prefix(6).map { ($0.identifier, $0.confidence) }, beam: beam))
     }
 }

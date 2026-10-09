@@ -6,8 +6,10 @@ import simd
 import UIKit
 
 nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
-    let classifier = SoundClassifier()
-    let beamClassifiers = beamAzimuths.indices.map { SoundClassifier(beam: $0) }  // ahead, left, behind, right
+    // All-around, then the beams ahead, left, behind, right; once per sound model (Debug › Sound model).
+    let builtIn: [any SoundListener] = [SoundClassifier()] + beamAzimuths.indices.map { SoundClassifier(beam: $0) }
+    let viaSoundML: [any SoundListener] = [SoundMLListener()] + beamAzimuths.indices.map { SoundMLListener(beam: $0) }
+    private var useSoundML = false  // capture queue only
     let words = WordListener()
     private let steerLock = NSLock()
     private var steering: [SIMD3<Float>] = []
@@ -16,7 +18,14 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     func steer(_ weights: [SIMD3<Float>]) { steerLock.withLock { steering = weights } }
 
     /// Blocks the classifiers skipped because the phone couldn't keep up.
-    var droppedBlocks: Int { ([classifier] + beamClassifiers).map(\.droppedBlocks).reduce(0, +) }
+    var droppedBlocks: Int { (builtIn + viaSoundML).map(\.droppedBlocks).reduce(0, +) }
+
+    /// Switch sound model; the newly used listeners start a fresh stream. Call on the capture queue.
+    func use(_ engine: SoundEngine) {
+        guard (engine == .soundML) != useSoundML else { return }
+        useSoundML = engine == .soundML
+        (useSoundML ? viaSoundML : builtIn).forEach { $0.reset() }
+    }
     var onBlock: (@Sendable (Block) -> Void)?
     private var maker = BlockMaker()  // one clock shared by direction and classifier
     private var recordURL: URL?
@@ -40,8 +49,9 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             let saved = (try? file?.write(from: buf)) != nil
             let made = maker.make(buf, savingAudio: saved, steering: steerLock.withLock { steering })
             onBlock?(made.block)
-            classifier.feed(made.omni, sampleRate: format.sampleRate, at: made.at)
-            for (k, beam) in made.beams.enumerated() { beamClassifiers[k].feed(beam, sampleRate: format.sampleRate, at: made.at) }
+            let listeners = useSoundML ? viaSoundML : builtIn
+            listeners[0].feed(made.omni, sampleRate: format.sampleRate, at: made.at)
+            for (k, beam) in made.beams.enumerated() { listeners[k + 1].feed(beam, sampleRate: format.sampleRate, at: made.at) }
             words.feed(made.omni, sampleRate: format.sampleRate, at: made.block.start)
         }
     }
@@ -74,6 +84,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     var alert: Alert? { detector.alert }
     var alertPulse: Int { detector.alertPulse }
     func loudestAzimuth(of kind: SoundKind? = nil) -> Double? { detector.loudestAzimuth(of: kind) }
+
+    /// Which sound model the 5 listeners use (Debug › Sound model), kept across launches.
+    var engine = SoundEngine(rawValue: UserDefaults.standard.string(forKey: "soundEngine") ?? "") ?? .apple {
+        didSet {
+            UserDefaults.standard.set(engine.rawValue, forKey: "soundEngine")
+            let tap = tap, engine = engine
+            queue.async { tap.use(engine) }
+            log("sound model: \(engine.rawValue)")
+        }
+    }
 
     func setCalibration(offset: Double, mirror: Bool) {
         detector.offset = offset
@@ -182,8 +202,11 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             configured = true
         }
         problem = nil
-        let session = session
-        queue.async { session.startRunning() }
+        let session = session, tap = tap, engine = engine
+        queue.async {
+            tap.use(engine)
+            session.startRunning()
+        }
         listeningStarted = true
         paused = false
         lastBlockAt = .now
@@ -210,7 +233,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             guard let self else { return }
             Task { @MainActor in self.add(b) }
         }
-        for c in [tap.classifier] + tap.beamClassifiers {
+        for c in tap.builtIn + tap.viaSoundML {
             c.onResult = { [weak self] heard in
                 guard let self else { return }
                 Task { @MainActor in self.hear(heard) }
@@ -436,7 +459,8 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         }
         if let end = held?.endedAt, Date.now.timeIntervalSince(end) > 8 { held = nil }
         return .make(paused: paused, micTrouble: micTrouble,
-                     warning: held.map { ($0.alert.what, $0.alert.azimuth, directionWords($0.alert.azimuth), $0.alert.short,
+                     // 15° steps: the alert follows its sound every block; the island needn't update for each degree.
+                     warning: held.map { ($0.alert.what, $0.alert.azimuth.map { ($0 / 15).rounded() * 15 }, directionWords($0.alert.azimuth), $0.alert.short,
                                          $0.alert.level == .critical, $0.endedAt) })
     }
 

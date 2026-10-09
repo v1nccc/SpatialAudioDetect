@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		000000000000000160000000 /* SoundRadarWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 000000000000000000000230 /* SoundRadarWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		000000000000000310000000 /* SoundML in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000320000000 /* SoundML */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -59,6 +60,7 @@
 		000000000000000130000000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				000000000000000310000000 /* SoundML in Frameworks */,
 			);
 		};
 		000000000000000230000000 /* Frameworks */ = {
@@ -110,6 +112,9 @@
 				000000000000000000000220 /* Shared */,
 			);
 			name = SpatialAudioDetect;
+			packageProductDependencies = (
+				000000000000000320000000 /* SoundML */,
+			);
 			productName = MyApp;
 			productReference = 000000000000000000000120 /* SpatialAudioDetect.app */;
 			productType = "com.apple.product-type.application";
@@ -157,6 +162,9 @@
 			);
 			mainGroup = 000000000000000000000001;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				000000000000000300000000 /* XCRemoteSwiftPackageReference "SoundML" */,
+			);
 			preferredProjectObjectVersion = 90;
 			productRefGroup = 000000000000000000000020 /* Products */;
 			projectDirPath = "";
@@ -507,6 +515,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		000000000000000300000000 /* XCRemoteSwiftPackageReference "SoundML" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/chrisladd/SoundML";
+			requirement = {
+				kind = exactVersion;
+				version = 0.2.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		000000000000000320000000 /* SoundML */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 000000000000000300000000 /* XCRemoteSwiftPackageReference "SoundML" */;
+			productName = SoundML;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 000000000000000000000000 /* Project object */;
 }

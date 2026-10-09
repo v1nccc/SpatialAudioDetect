@@ -1,0 +1,15 @@
+{
+  "originHash" : "1893b555e0d8b1a015850f5d1a9faddb261495d86a20598a4d4dacd0c38ac466",
+  "pins" : [
+    {
+      "identity" : "soundml",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/chrisladd/SoundML",
+      "state" : {
+        "revision" : "392c2c16327b611cd342688645964dde40f72d47",
+        "version" : "0.2.0"
+      }
+    }
+  ],
+  "version" : 3
+}
