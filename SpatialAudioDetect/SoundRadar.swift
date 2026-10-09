@@ -459,7 +459,8 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         }
         if let end = held?.endedAt, Date.now.timeIntervalSince(end) > 8 { held = nil }
         return .make(paused: paused, micTrouble: micTrouble,
-                     warning: held.map { ($0.alert.what, $0.alert.azimuth, directionWords($0.alert.azimuth), $0.alert.short,
+                     // 15° steps: the alert follows its sound every block; the island needn't update for each degree.
+                     warning: held.map { ($0.alert.what, $0.alert.azimuth.map { ($0 / 15).rounded() * 15 }, directionWords($0.alert.azimuth), $0.alert.short,
                                          $0.alert.level == .critical, $0.endedAt) })
     }
 

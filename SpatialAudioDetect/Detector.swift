@@ -227,15 +227,18 @@ nonisolated func beamEstimate(_ scores: [Double]) -> Double? {
 
 /// Which direction a classified sound came from. Confirmed: the heard direction nearest to where its beam scores
 /// point. Otherwise, in order: the same sound's last confirmed direction (`previous`, a siren doesn't jump), the
-/// beams' rough pointing, the only direction heard; nil = genuinely unclear (several sounds, no beam evidence).
-nonisolated func pickDirection(sources: [Double], beams: Double?, previous: Double?) -> (azimuth: Double, confirmed: Bool)? {
+/// beams' rough pointing, the only direction heard, the heard direction nearest the loudest one in that half second
+/// (`loudest`, the arrow: an alert sound every beam hears clearly is usually the loudest thing); nil = no direction at all.
+nonisolated func pickDirection(sources: [Double], beams: Double?, previous: Double?, loudest: Double? = nil) -> (azimuth: Double, confirmed: Bool)? {
     if let beams {
         if let nearest = sources.min(by: { angularDistance($0, beams) < angularDistance($1, beams) }),
            angularDistance(nearest, beams) <= 90 { return (nearest, true) }
         return (previous ?? beams, false)
     }
     if let previous { return (previous, false) }
-    return sources.count == 1 ? (sources[0], false) : nil
+    if sources.count == 1 { return (sources[0], false) }
+    guard let loudest else { return nil }
+    return (sources.min(by: { angularDistance($0, loudest) < angularDistance($1, loudest) }) ?? loudest, false)
 }
 
 nonisolated let sirenLabels: Set<String> = ["siren", "police_siren", "ambulance_siren", "fire_engine_siren",
@@ -709,6 +712,7 @@ nonisolated struct Detector {
     private(set) var beamWeights: [SIMD3<Float>] = beamAzimuths.map { SIMD3(Float(cos($0 * .pi / 180)), Float(sin($0 * .pi / 180)), 0) }
     private var mics = [Double](repeating: -120, count: phoneSides.count)
     private var alertUntil = -Double.infinity
+    private var alertHeardAt = -Double.infinity  // last time the shown alert's sound was (re)confirmed
     private var lastPulse = -Double.infinity
 
     /// Strongest recent direction, optionally only among spokes tagged with `kind`.
@@ -794,17 +798,25 @@ nonisolated struct Detector {
             ? beamAzimuths.indices.map { k in fam.map { beams[k]?.alertScores[$0] ?? 0 }.max() ?? 0 } : []
         let sources = soundSources(recent, from: start, to: end), pointing = beamEstimate(beamScores)
         let previous = lastFix.flatMap { fam.contains($0.label) && clock - $0.at < 3 ? $0.azimuth : nil }
-        let picked = pickDirection(sources: sources, beams: pointing, previous: previous)
+        let loudest = soundDirection(recent, from: start, to: end)?.azimuth
+        let picked = pickDirection(sources: sources, beams: pointing, previous: previous, loudest: loudest)
         // Confirmed, or the remembered one reused: keep it alive while the same sound goes on.
         if let picked, picked.confirmed || picked.azimuth == previous { lastFix = (pick.label, picked.azimuth, clock) }
-        let azimuth = picked?.azimuth
+        var azimuth = picked?.azimuth
+        // Already showing this sound and following it live (add): keep that, unless this verdict puts it elsewhere.
+        // The verdict is about audio from ~0.5–1 s ago, so a moving sound would otherwise jump back.
+        let live = alert?.what == alertName(pick.label).what && clock - alertHeardAt < 1 ? alert?.azimuth : nil
+        let followed = live.map { l in azimuth.map { angularDistance($0, l) <= 45 } ?? true } ?? false
+        if followed { azimuth = live }
         currentLabel = pick.label
         let directionReason = switch picked {
-        case nil: "unclear: several sounds heard and the beams give no evidence"
+        case _ where followed: "followed live since it was first placed (this verdict agrees)"
+        case nil: "unclear: no direction measured (the phone's pose has no \"ahead\")"
         case let p? where p.confirmed: "the heard direction nearest to where the beams point"
         case let p? where p.azimuth == previous: "kept: this sound's last confirmed direction"
         case _ where pointing != nil: "the beams' rough pointing (no heard direction within 90°)"
-        default: "the only direction heard"
+        case _ where sources.count == 1: "the only direction heard"
+        default: "the heard direction nearest the loudest one (the arrow); the beams give no evidence"
         }
         let overUsual = zip2(peakDB(recent, from: start, to: end), levels.usual).map { $0 - $1 }
         lastJudged = JudgedWindow(label: pick.label, score: pick.score, beamScores: beamScores, sources: sources,
@@ -873,6 +885,7 @@ nonisolated struct Detector {
             }
             recent.append(DirectionSample(t: b.start, azimuth: az, power: r.ww * r.directness, strength: strength, db: r.db, spec: spec))
             recent.removeAll { $0.t < b.start - 8 }
+            followAlert()
             let center = slot(az, of: bins.count)
             for (d, k) in [(0, 1.0), (-1, 0.5), (1, 0.5)] {
                 let j = (center + d + bins.count) % bins.count
@@ -898,6 +911,19 @@ nonisolated struct Detector {
                           loudness: loudness, strength: strength)
         last = p
         return p
+    }
+
+    /// The classifier says what and roughly where, ~0.5–1 s late and 4× a second. While that sound is still being
+    /// heard, move the alert every block toward the nearest direction heard in the last 0.3 s (within 30°), so a
+    /// passing siren or your own turn shows at once instead of lagging.
+    private mutating func followAlert() {
+        guard var a = alert, let current = a.azimuth, clock - alertHeardAt < 1,
+              let live = histogramPeaks(sourceHistogram(recent, from: clock - 0.3, to: clock + 1))
+                  .min(by: { angularDistance($0, current) < angularDistance($1, current) }),
+              angularDistance(live, current) <= 30 else { return }
+        a.azimuth = remainder(current + 0.2 * remainder(live - current, 360), 360)
+        alert = a
+        if let fix = lastFix, alertName(fix.label).what == a.what { lastFix = (fix.label, a.azimuth!, clock) }
     }
 
     /// The street's usual level (median of the last 30 s), once known.
@@ -942,6 +968,7 @@ nonisolated struct Detector {
         let isNew = alert == nil || alert?.what != a.what || alert?.level != a.level
         alert = a
         alertUntil = clock + 3
+        alertHeardAt = clock
         if (isNew && clock - lastPulse > 1.5) || clock - lastPulse > 10 {
             alertPulse += 1
             lastPulse = clock
@@ -981,6 +1008,8 @@ nonisolated func selfCheck() {
     precondition(pickDirection(sources: [-45, 90], beams: nil, previous: nil) == nil, "two sounds, no evidence: unclear")
     precondition(pickDirection(sources: [-45], beams: 124, previous: 88)! == (88, false), "keeps the last confirmed direction")
     precondition(pickDirection(sources: [90], beams: nil, previous: nil)! == (90, false), "only one thing heard")
+    precondition(pickDirection(sources: [-45, 90], beams: nil, previous: nil, loudest: 70)! == (90, false),
+                 "two sounds, no beam evidence: the one nearest the loudest direction, not 'around you'")
     // Priority and confirmation: critical first; one siren-like moment isn't a siren; a honk counts at once.
     let sk = familyKey("siren")
     precondition(pickAlert(["dog_bark": 0.9, "police_siren": 0.6], trails: [familyKey("dog_bark"): [0.9, 0.9], sk: [0.6, 0.6]])!.label == "police_siren",
@@ -1132,6 +1161,27 @@ nonisolated func selfCheck() {
         if t > 5 { precondition(angularDistance(p.azimuth!, truth) < 5, "arrow should follow a moved sound within 1 s -> \(p.azimuth!)") }
     }
     precondition(arrowErrors.max()! < blockErrors.max()! / 2, "arrow not steadier: \(arrowErrors.max()!) vs \(blockErrors.max()!)")
+    // The alert follows its sound live: a siren on the left moving to ahead at 45°/s, while the classifier's
+    // verdicts describe audio from 0.75 s earlier (they alone would lag ~34°).
+    func toward(_ deg: Double) -> [SIMD4<Float>] {
+        let v = cos(deg * .pi / 180) * foaFront + sin(deg * .pi / 180) * foaLeft
+        return Array(repeating: SIMD4(Float(v.x), Float(v.y), Float(v.z), 1), count: 20)
+    }
+    var follow = Detector(), worstLag = 0.0
+    for k in 0..<300 {
+        let t = Double(k) * 0.02, now = t < 2 ? 90 : max(90 - 45 * (t - 2), 0)
+        follow.add(Block(reading: plane(-40, from: now), start: t, duration: 0.02, format: "", savingAudio: false, bins: toward(now)),
+                   motion: Motion())
+        if k % 12 == 0, t >= 1 {
+            for beam in [nil] + beamAzimuths.indices.map(Optional.some) {
+                follow.hear(Heard(kind: .alert, label: "siren", alertScore: 0.9, start: t - 0.75, end: t - 0.25, top: [], beam: beam,
+                                  alerts: ["siren": 0.9]))
+            }
+        }
+        if t > 2.5, t < 4 { worstLag = max(worstLag, angularDistance(follow.alert!.azimuth!, now)) }
+    }
+    precondition(worstLag < 15, "alert should follow a moving siren -> lagged \(worstLag)°")
+
     // Direction test: a phone that reads everything mirrored and 20° off is recovered.
     let fit = fitFineTune([(0, 20), (90, -70), (180, -160)])!
     precondition(fit.mirror && angularDistance(fit.offset, 20) < 0.5 && fit.leftover < 0.5, "fine-tune fit -> \(fit)")

@@ -131,7 +131,7 @@ struct PipelineView: View {
             }
         }
         if let j, !j.label.isEmpty {
-            step("⑩ Which sound, and where it is", "Critical sounds (sirens, skids, screams, trains, then horns) win over louder warnings; a sound already alerting keeps priority. Its direction: the heard direction (⑦) that its beam scores point at, not just the loudest thing.") {
+            step("⑩ Which sound, and where it is", "Critical sounds (sirens, skids, screams, trains, then horns) win over louder warnings; a sound already alerting keeps priority. Its direction: the heard direction (⑦) that its beam scores point at, not just the loudest thing. Verdicts describe audio from ~0.5–1 s ago, so while the sound is still heard the alert then follows it live, each block moving to the nearest direction heard in the last 0.3 s (within 30°).") {
                 row("Picked", "\(alertName(j.label).what) · \(f(j.score))")
                 if let lo = j.beamScores.min(), let hi = j.beamScores.max() {
                     Text("Its score through each beam:").font(.caption).foregroundStyle(.secondary)

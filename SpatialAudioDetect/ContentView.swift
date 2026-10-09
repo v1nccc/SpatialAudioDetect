@@ -53,7 +53,9 @@ struct ContentView: View {
         }
         .onChange(of: offset, initial: true) { radar.setCalibration(offset: offset, mirror: mirror) }
         .onChange(of: mirror) { radar.setCalibration(offset: offset, mirror: mirror) }
-        .animation(.easeOut(duration: 0.2), value: radar.alert)
+        // Not on every direction change: the alert follows its sound many times a second.
+        .animation(.easeOut(duration: 0.2), value: radar.alert?.what)
+        .animation(.easeOut(duration: 0.2), value: radar.alert?.level)
         .task {
             UIApplication.shared.isIdleTimerDisabled = true  // keep the screen on while running
             radar.cleanUpIfIdle()
@@ -121,6 +123,8 @@ struct ContentView: View {
         }
         .buttonStyle(.borderedProminent)
         .font(.title3.bold())
+        .padding(12)
+        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))  // red Stop stays visible on a red alert
     }
 
     // MARK: Radar: you in the middle, ahead is up

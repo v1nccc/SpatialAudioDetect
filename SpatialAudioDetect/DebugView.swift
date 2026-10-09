@@ -180,7 +180,7 @@ struct DebugView: View {
         } header: {
             Text("⑥ Sound classifier (all-around + 4 beams, 0.5 s windows)")
         } footer: {
-            Text("\(radar.engine == .apple ? "Apple's raw top guesses" : "Sounds over their threshold (SoundML)") (all-around mic); several can be high at once. Bar colour = the app's category (red alert, orange traffic, blue people, grey ignored). Alerts need confirming: sirens and other lasting sounds ≥ 0.5 in 2 of the last 3 windows, horns ≥ \(f(alertThreshold)) once, others ≥ 0.7 once or ≥ 0.5 twice in a row (best of the 5 listeners). Critical sounds win over louder warnings. Direction: each frequency's own direction gives the separate sounds heard; the beam that hears the alert best tells which of them it is.")
+            Text("\(radar.engine == .apple ? "Apple's raw top guesses" : "Sounds over their threshold (SoundML)") (all-around mic); several can be high at once. Bar colour = the app's category (red alert, orange traffic, blue people, grey ignored). Alerts need confirming: sirens and other lasting sounds ≥ 0.5 in 2 of the last 3 windows, horns ≥ \(f(alertThreshold)) once, others ≥ 0.7 once or ≥ 0.5 twice in a row (best of the 5 listeners). Critical sounds win over louder warnings. Direction: each frequency's own direction gives the separate sounds heard; the beam that hears the alert best tells which of them it is (or, without beam evidence, the one nearest the loudest direction). While the sound lasts, the alert then follows it live.")
         }
     }
 
