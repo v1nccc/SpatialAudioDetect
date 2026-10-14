@@ -65,13 +65,13 @@ struct DebugView: View {
     private var soundModelSection: some View {
         Section {
             Picker("Sound model", selection: Binding(get: { radar.engine }, set: { radar.engine = $0 })) {
-                ForEach(SoundEngine.allCases, id: \.self) { Text($0.rawValue) }
+                ForEach(SoundEngine.allCases, id: \.self) { Text($0.label) }
             }
             .pickerStyle(.segmented)
         } header: {
             Text("Sound model")
         } footer: {
-            Text("Apple direct: Apple's built-in sound classifier, exact timing and every score. SoundML: the same Apple model through the SoundML package; it only reports sounds over their threshold and its timing is estimated. Switch any time, even while listening; the decisions log notes each switch, so recordings say which was used.")
+            Text("Apple: Apple's built-in sound classifier, exact timing and every score. SoundML: the same Apple model through the SoundML package; it only reports sounds over their threshold and its timing is estimated. Both stop working in the background (iOS blocks the GPU they run on).\n\nOwn model: a tiny model of our own (siren, car horn, background) on the CPU and Neural Engine, to find out what keeps working with the phone locked. Trained on synthetic sounds only, so expect misses and false alarms on real ones. Test: pick it, Start, lock the phone for a minute (play a siren video if you like), unlock. If the island turned yellow (\"not recognized\") or the decisions log says \"sound recognition stopped\", it failed too.\n\nSwitch any time, even while listening; the decisions log notes each switch.")
         }
     }
 

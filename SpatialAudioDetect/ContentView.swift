@@ -22,6 +22,7 @@ struct ContentView: View {
     @State private var debugging = false
     @State private var tuningHaptics = false
     @State private var explaining = false
+    @State private var evaluating = false
     // Fine-tune, in case the phone's axes differ from what the app assumes.
     @AppStorage("rotate") private var offset = 0.0
     @AppStorage("mirror") private var mirror = false
@@ -43,6 +44,7 @@ struct ContentView: View {
                     Button("How it's measured", systemImage: "function") { explaining = true }
                 }
                 ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button("Evaluate", systemImage: "checklist") { evaluating = true }
                     Button("Alerts", systemImage: "bell.badge") { tuningHaptics = true }
                     Button("Debug", systemImage: "ladybug") { debugging = true }
                 }
@@ -50,6 +52,7 @@ struct ContentView: View {
             .sheet(isPresented: $debugging) { DebugView(radar: radar, offset: $offset, mirror: $mirror) }
             .sheet(isPresented: $tuningHaptics) { HapticsView(radar: radar) }
             .sheet(isPresented: $explaining) { PipelineView(radar: radar) }
+            .sheet(isPresented: $evaluating) { EvaluationView(radar: radar) }
         }
         .onChange(of: offset, initial: true) { radar.setCalibration(offset: offset, mirror: mirror) }
         .onChange(of: mirror) { radar.setCalibration(offset: offset, mirror: mirror) }
@@ -74,6 +77,8 @@ struct ContentView: View {
                 ("pause.circle.fill", .secondary, "Paused", "Not listening. Resume below or from the Dynamic Island.")
             } else if let trouble = radar.micTrouble {
                 ("mic.slash.fill", .orange, "Not hearing anything", trouble)
+            } else if radar.recognitionDown && radar.alert == nil {
+                ("waveform.slash", .yellow, "Can't recognize sounds", "Sirens and horns aren't being recognized right now. Directions still work; restarting…")
             } else if let a = radar.alert {
                 (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", a.level.color,
                  a.level == .critical ? "Watch out!" : "Heads up", "\(a.what) \(directionWords(a.azimuth))")
@@ -191,4 +196,5 @@ struct ContentView: View {
     selfCheck()
     hapticsSelfCheck()
     radarActivitySelfCheck()
+    evaluationSelfCheck()
 }

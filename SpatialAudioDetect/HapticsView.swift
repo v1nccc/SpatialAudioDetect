@@ -30,7 +30,7 @@ struct HapticsView: View {
                 } header: {
                     Text("Delivery")
                 } footer: {
-                    Text("Your own rhythms need Core Haptics, which iOS may stop when the app isn't on screen. The test below finds out what still works on this iPhone. A notification uses the phone's own vibration, not your rhythm.")
+                    Text("Your own rhythms need Core Haptics, which iOS doesn't play while the app isn't on screen (only the Dynamic Island, or locked). Then “Custom pattern” switches to the system vibration in the same rhythm, with coarser pulses. The test below finds out what works on this iPhone. A notification uses the phone's own vibration, not your rhythm.")
                 }
                 HapticTestSection(test: radar.hapticTest, haptics: radar.haptics, settings: settings, mic: { radar.micStatus })
             }
