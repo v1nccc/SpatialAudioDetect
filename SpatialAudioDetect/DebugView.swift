@@ -1,4 +1,3 @@
-import simd
 import SwiftUI
 
 /// Every stage of the pipeline, live and in processing order (① mics → ⑨ decision),
@@ -12,9 +11,6 @@ struct DebugView: View {
     @State private var refMeters = 1.0
     @State private var tested: [Double: (mean: Double, spread: Double)] = [:]  // true direction -> arrow, fine-tune off
     @State private var measuring: Double?
-    @State private var probes: [String: SIMD3<Double>] = [:]  // phone side -> where its snaps were heard (app's frame)
-    @State private var probing: String?
-    @State private var probeFailed: [String: Double] = [:]  // side -> how far over the room it got (too quiet)
 
     var body: some View {
         NavigationStack {
@@ -34,7 +30,6 @@ struct DebugView: View {
                 } else {
                     Section { Text("Waiting for audio…").foregroundStyle(.secondary) }
                 }
-                axisCheckSection
                 directionTestSection
                 fineTuneSection
             }
@@ -70,13 +65,13 @@ struct DebugView: View {
     private var soundModelSection: some View {
         Section {
             Picker("Sound model", selection: Binding(get: { radar.engine }, set: { radar.engine = $0 })) {
-                ForEach(SoundEngine.allCases, id: \.self) { Text($0.label) }
+                ForEach(SoundEngine.allCases, id: \.self) { Text($0.rawValue) }
             }
             .pickerStyle(.segmented)
         } header: {
             Text("Sound model")
         } footer: {
-            Text("Apple: Apple's built-in sound classifier, exact timing and every score. SoundML: the same Apple model through the SoundML package; it only reports sounds over their threshold and its timing is estimated. Both stop working in the background (iOS blocks the GPU they run on).\n\nOwn model: a tiny model of our own (siren, car horn, background) on the CPU and Neural Engine, to find out what keeps working with the phone locked. Trained on synthetic sounds only, so expect misses and false alarms on real ones. Test: pick it, Start, lock the phone for a minute (play a siren video if you like), unlock. If the island turned yellow (\"not recognized\") or the decisions log says \"sound recognition stopped\", it failed too.\n\nSwitch any time, even while listening; the decisions log notes each switch.")
+            Text("Apple direct: Apple's built-in sound classifier, exact timing and every score. SoundML: the same Apple model through the SoundML package; it only reports sounds over their threshold and its timing is estimated. Switch any time, even while listening; the decisions log notes each switch, so recordings say which was used.")
         }
     }
 
@@ -270,93 +265,6 @@ struct DebugView: View {
         }
     }
 
-    /// Snap next to three sides of the phone: shows which way iOS's spatial channels really point, and fixes a swap.
-    private var axisCheckSection: some View {
-        let sides = [("back", "Back (camera)"), ("left", "Left edge"), ("top", "Top edge")]
-        let expected: [String: SIMD3<Double>] = ["back": SIMD3(1, 0, 0), "left": SIMD3(0, 1, 0), "top": SIMD3(0, 0, 1)]
-        let swap = zip3(probes["back"], probes["left"], probes["top"]).flatMap { axisSwap(back: $0, left: $1, top: $2) }
-        return Section {
-            HStack {
-                ForEach(sides, id: \.0) { key, title in
-                    Button(title) {
-                        Task {
-                            probing = key
-                            let r = await radar.probeAxis()
-                            probes[key] = r.direction
-                            probeFailed[key] = r.direction == nil ? r.rise : nil
-                            probing = nil
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .frame(maxWidth: .infinity)
-                }
-            }
-            .disabled(probing != nil || radar.debug == nil)
-            if let p = probing {
-                let rise = radar.probeRise.map { max($0, 0) } ?? 0
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Make a sound right next to the \(sides.first { $0.0 == p }!.1.lowercased()) for 5 s: say “aaaah”, hum, or hold another phone playing a video there.")
-                        .font(.callout)
-                    ProgressView(value: min(rise / probeRiseDB, 1))
-                        .tint(rise >= probeRiseDB ? .green : .orange)
-                    Text(rise >= probeRiseDB ? "Loud enough ✓ keep going" : String(format: "Louder or closer: +%.0f dB over the room, need +%.0f", rise, probeRiseDB))
-                        .font(.caption).foregroundStyle(rise >= probeRiseDB ? .green : .orange)
-                }
-            }
-            if !probes.isEmpty || !probeFailed.isEmpty {
-                ForEach(sides, id: \.0) { key, title in
-                    let m = probes[key], right = m.map { simd_dot($0, expected[key]!) >= 0.5 }
-                    HStack(alignment: .firstTextBaseline) {
-                        Image(systemName: right == nil ? "circle.dashed" : right! ? "checkmark.circle.fill" : "xmark.circle.fill")
-                            .foregroundStyle(right == nil ? Color.secondary : right! ? Color.green : Color.red)
-                        Text(title).bold()
-                        Spacer()
-                        Text(m.map { "heard at the \(sideName($0)) (\(String(format: "%.2f", max(abs($0.x), abs($0.y), abs($0.z)))))" }
-                             ?? probeFailed[key].map { String(format: "too quiet (+%.0f dB, need +%.0f): closer, louder", max($0, 0), probeRiseDB) }
-                             ?? "not done yet")
-                            .foregroundStyle(right == nil ? (probeFailed[key] != nil ? Color.orange : Color.secondary) : right! ? Color.green : Color.red)
-                            .multilineTextAlignment(.trailing)
-                    }
-                    .font(.callout)
-                }
-            }
-            if probes.count == 3 {
-                if let swap {
-                    if swap == identityAxes {
-                        Label("Every side reads right: the axes are correct. Next: the direction test below.", systemImage: "checkmark.seal.fill")
-                            .foregroundStyle(.green)
-                    } else {
-                        Text("iOS's axes differ from what the app assumed: \(axesText(composeAxes(swap, radar.axes))).").font(.callout)
-                        Button("Apply the axis fix") {
-                            radar.setAxes(composeAxes(swap, radar.axes))
-                            probes = [:]
-                            offset = 0  // the old fine-tune was set for the wrong axes
-                            mirror = false
-                        }
-                        .buttonStyle(.borderedProminent)
-                    }
-                } else {
-                    Text("Unclear: a side was heard weakly or two sides on the same axis. Try again in a quiet room, snapping closer (5–10 cm) and louder.")
-                        .font(.callout).foregroundStyle(.orange)
-                }
-            }
-            LabeledContent("Axes in use", value: axesText(radar.axes))
-            if radar.axes != identityAxes {
-                Button("Reset to the app's default", role: .destructive) { radar.setAxes(identityAxes) }
-            }
-        } header: {
-            Text("Step 1: mic axis check")
-        } footer: {
-            Text("Apple doesn't document which way the iPhone's spatial channels point; the app assumes front = camera side, left = left edge, up = top edge. If that's wrong, every direction is wrong whatever the fine-tune. A quiet room is best: listening must be on, hold the phone still in any pose, tap a side, then for 5 s make a sound about 5 cm from the middle of that side (not a corner): say “aaaah”, hum, or hold another phone playing a video there. Watch the bar go green. Don't tap or knock the phone itself: that shakes the whole body, not one side. Do all three, then apply the fix if one is offered (it also resets the fine-tune), then run step 2.")
-        }
-    }
-
-    /// "top edge", "camera side", … for the strongest axis of a direction in the app's front/left/up frame.
-    private func sideName(_ m: SIMD3<Double>) -> String {
-        let a = (0..<3).max { abs(m[$0]) < abs(m[$1]) }!
-        return [["back (camera side)", "screen side"], ["left edge", "right edge"], ["top edge", "bottom edge"]][a][m[a] > 0 ? 0 : 1]
-    }
-
     /// Play a sound from a known direction, measure where the arrow points: accuracy, scatter, and the fine-tune that fixes it.
     private var directionTestSection: some View {
         let names: [Double: String] = [0: "Ahead", 90: "Left", 180: "Behind", -90: "Right"]
@@ -384,7 +292,7 @@ struct DebugView: View {
             }
             if !tested.isEmpty { Button("Clear results", role: .destructive) { tested = [:] } }
         } header: {
-            Text("Step 2: direction test")
+            Text("Direction test")
         } footer: {
             Text("Stand still, holding the phone the way you'll run with it. Play a steady sound (a traffic or siren video) from a speaker about 2 m away, then tap where it is. Do at least Ahead and Left; all four also shows front/back mix-ups. Outdoors is best: walls echo. Off = how wrong the arrow is; wobble = how much it moves while the sound stays put.")
         }
@@ -450,10 +358,4 @@ struct DebugView: View {
 
     private func db(_ power: Double) -> Double { 10 * log10(max(power, 1e-12)) }
     private func f(_ v: Double, _ digits: Int = 2) -> String { v.formatted(.number.precision(.fractionLength(digits))) }
-}
-
-/// All three values, or nil.
-private func zip3<A, B, C>(_ a: A?, _ b: B?, _ c: C?) -> (A, B, C)? {
-    guard let a, let b, let c else { return nil }
-    return (a, b, c)
 }

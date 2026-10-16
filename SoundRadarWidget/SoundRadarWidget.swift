@@ -123,8 +123,6 @@ struct StatusIcon: View {
                 Image(systemName: "pause.circle.fill")
             case .interrupted:
                 Image(systemName: "mic.slash.fill")
-            case .limited:
-                Image(systemName: "waveform.slash")
             case .warning:
                 if let azimuth = state.azimuth {
                     Image(systemName: "arrow.up.circle.fill").rotationEffect(.degrees(-azimuth))  // up = ahead, like the app
@@ -142,7 +140,7 @@ extension RadarActivity.ContentState {
         return switch status {
         case .listening: .green
         case .warning: critical ? .red : .orange
-        case .interrupted, .limited: .yellow
+        case .interrupted: .yellow
         case .paused: .gray
         }
     }

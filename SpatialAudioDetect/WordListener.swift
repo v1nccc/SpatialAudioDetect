@@ -52,8 +52,7 @@ nonisolated final class WordListener: @unchecked Sendable {
         let context = AnalysisContext()
         context.contextualStrings[.general] = locked { names + words }  // bias recognition toward the name
         try await analyzer.setContext(context)
-        // Capped (~2 s): if the transcriber stalls (e.g. in the background), old audio is dropped instead of piling up in memory.
-        let (stream, input) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .bufferingNewest(100))
+        let (stream, input) = AsyncStream<AnalyzerInput>.makeStream()
         try await analyzer.start(inputSequence: stream)
         locked {
             self.analyzer = analyzer

@@ -1,5 +1,4 @@
 @preconcurrency import AVFoundation
-import CoreML
 @preconcurrency import SoundAnalysis
 
 nonisolated enum SoundKind: Sendable { case other, people, traffic, alert }
@@ -55,7 +54,6 @@ nonisolated extension Heard {
 /// (SoundClassifier), or through the SoundML package (SoundMLListener), switchable in Debug to compare.
 nonisolated protocol SoundListener: AnyObject, Sendable {
     var onResult: (@Sendable (Heard) -> Void)? { get set }
-    var onTrouble: (@Sendable (String) -> Void)? { get set }  // it failed or stalled and restarted itself (decisions log)
     var droppedBlocks: Int { get }
     /// Call from one serial queue (the capture queue). `at` = frames since capture start.
     func feed(_ samples: [Float], sampleRate: Double, at: AVAudioFramePosition)
@@ -64,8 +62,7 @@ nonisolated protocol SoundListener: AnyObject, Sendable {
 }
 
 nonisolated enum SoundEngine: String, CaseIterable, Sendable {
-    case apple = "Apple direct", soundML = "SoundML", cpuModel = "CPU model (test)"
-    var label: String { [.apple: "Apple", .soundML: "SoundML", .cpuModel: "Own model"][self]! }
+    case apple = "Apple direct", soundML = "SoundML"
 }
 
 /// "car_horn" -> "Car horn"
@@ -74,101 +71,60 @@ nonisolated func pretty(_ id: String) -> String {
     return s.prefix(1).uppercased() + s.dropFirst()
 }
 
-/// Runs Apple's sound classifier on one signal (the all-around mic or one beam); a verdict every 0.25 s. With `model`,
-/// runs that Core ML sound model instead (our own test model, for the background test).
+/// Runs Apple's sound classifier on one signal (the all-around mic or one beam); a verdict every 0.25 s.
 nonisolated final class SoundClassifier: NSObject, SNResultsObserving, SoundListener, @unchecked Sendable {
     let beam: Int?
     var onResult: (@Sendable (Heard) -> Void)?
-    var onTrouble: (@Sendable (String) -> Void)?
-    private var analyzer: SNAudioStreamAnalyzer?  // feed queue only, like format and queue
+    private var analyzer: SNAudioStreamAnalyzer?
     private var format: AVAudioFormat?
-    private var queue = DispatchQueue(label: "sound-classify")
-    private var retryAt = 0.0, retryDelay = 1.0, reported: (why: String, at: Double)?  // restart pacing (stream seconds)
+    private let queue = DispatchQueue(label: "sound-classify")
     private let lock = NSLock()
-    // Under lock: blocks waiting / skipped, which analyzer they belong to, the live request, why it must be rebuilt,
-    // and the stream time its latest verdict reached.
-    private var pending = 0, dropped = 0, generation = 0
-    private var request: AnyObject?, trouble: String?, lastHeard = 0.0, answered = false
-    private let realTime: Bool
-    private let model: MLModel?
+    private var pending = 0, dropped = 0
+    private let maxBacklog: Int
 
     /// `realTime`: skip audio rather than fall behind (live). The replay tool feeds faster than real time, so it doesn't.
-    init(beam: Int? = nil, realTime: Bool = true, model: MLModel? = nil) {
+    init(beam: Int? = nil, realTime: Bool = true) {
         self.beam = beam
-        self.realTime = realTime
-        self.model = model
+        maxBacklog = realTime ? 24 : .max  // ~0.5 s of blocks waiting
     }
 
     /// Blocks skipped because the phone couldn't keep up (live only).
     var droppedBlocks: Int { lock.withLock { dropped } }
 
-    func reset() {
-        analyzer = nil
-        retryDelay = 1
-    }
+    func reset() { analyzer = nil }
 
     func feed(_ samples: [Float], sampleRate: Double, at: AVAudioFramePosition) {
-        let now = Double(at) / sampleRate
-        // Self-healing: iOS can fail or end the analysis (e.g. under background limits) or it can hang, and then it never
-        // answers again: no alerts until the app is relaunched. Rebuild it, on a fresh queue in case the old one is stuck.
-        let (why, answered) = lock.withLock { () -> (String?, Bool) in
-            (trouble ?? (realTime && analyzer != nil && now - lastHeard > 4 ? "no verdict for 4 s" : nil), self.answered)
-        }
-        if answered { retryDelay = 1 }
-        // Paced: 1 s, then 2, 4, … up to 16 s while it keeps failing (in the background iOS refuses it every time);
-        // each reason logged at most every 10 s.
-        if let why, now >= retryAt {
-            if reported.map({ $0.why != why || now - $0.at > 10 }) ?? true {
-                onTrouble?(why + "; restarted it")
-                reported = (why, now)
-            }
-            analyzer = nil
-            queue = DispatchQueue(label: "sound-classify")
-            retryAt = now + retryDelay
-            retryDelay = min(retryDelay * 2, 16)
-        }
         if analyzer == nil, let f = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1),
-           let request = try? model.map({ try SNClassifySoundRequest(mlModel: $0) }) ?? SNClassifySoundRequest(classifierIdentifier: .version1) {
-            // Shortest window Apple allows: a 1 s window drowned out 0.3 s honks in testing. A custom model keeps the
-            // window it was trained with.
-            if model == nil { request.windowDuration = CMTime(seconds: 0.5, preferredTimescale: 1000) }
+           let request = try? SNClassifySoundRequest(classifierIdentifier: .version1) {
+            // Shortest window Apple allows: a 1 s window drowned out 0.3 s honks in testing.
+            request.windowDuration = CMTime(seconds: 0.5, preferredTimescale: 1000)
             request.overlapFactor = 0.5
             let a = SNAudioStreamAnalyzer(format: f)
             try? a.add(request, withObserver: self)
             analyzer = a
             format = f
-            lock.withLock { (self.request, trouble, lastHeard, pending, self.answered) = (request, nil, now, 0, false); generation += 1 }
         }
         guard let analyzer, let format, !samples.isEmpty,
               let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else { return }
         buf.frameLength = buf.frameCapacity
         samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
-        let gen = lock.withLock { () -> Int? in
-            if realTime && pending >= 24 { dropped += 1; return nil }  // ~0.5 s of blocks already waiting: skip, don't lag
+        let behind = lock.withLock { () -> Bool in
+            if pending >= maxBacklog { dropped += 1; return true }
             pending += 1
-            return generation
+            return false
         }
-        guard let gen else { return }
+        if behind { return }
         queue.async {
             analyzer.analyze(buf, atAudioFramePosition: at)
-            self.lock.withLock { if self.generation == gen { self.pending -= 1 } }
+            self.lock.withLock { self.pending -= 1 }
         }
     }
 
     /// Process everything fed so far and deliver the last verdicts (replay tool).
     func finish() { queue.sync { analyzer?.completeAnalysis() } }
 
-    func request(_ request: SNRequest, didFailWithError error: Error) {
-        lock.withLock { if request === self.request { trouble = "failed (\(error.localizedDescription))" } }
-    }
-
-    func requestDidComplete(_ request: SNRequest) {
-        lock.withLock { if request === self.request, trouble == nil { trouble = "stopped by iOS" } }
-    }
-
     func request(_ request: SNRequest, didProduce result: SNResult) {
         guard let r = result as? SNClassificationResult else { return }
-        lock.withLock { if request === self.request { lastHeard = max(lastHeard, r.timeRange.end.seconds); answered = true } }
         let scores = Dictionary(r.classifications.map { ($0.identifier, $0.confidence) }, uniquingKeysWith: max)
         onResult?(Heard(scores: scores, start: r.timeRange.start.seconds, end: r.timeRange.end.seconds,
                         top: r.classifications.prefix(6).map { ($0.identifier, $0.confidence) }, beam: beam))
