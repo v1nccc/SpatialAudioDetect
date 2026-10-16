@@ -4,7 +4,7 @@ import Foundation
 /// What the Dynamic Island and Lock Screen show while Sound Radar runs (shared by the app and the widget).
 nonisolated struct RadarActivity: ActivityAttributes {
     nonisolated struct ContentState: Codable, Hashable {
-        nonisolated enum Status: String, Codable, Hashable { case listening, warning, interrupted, paused }
+        nonisolated enum Status: String, Codable, Hashable { case listening, warning, interrupted, paused, limited }
         var status: Status
         var title: String           // "Listening", "Car horn", "Mic interrupted", "Paused"
         var detail: String          // "behind you", "a call, Siri or another app has the mic"
@@ -13,14 +13,20 @@ nonisolated struct RadarActivity: ActivityAttributes {
         var endedAt: Date? = nil    // a warning still shown after it stopped: when it stopped
         var critical = false        // red and pops the island open; otherwise an orange heads-up
 
-        /// Most important first: a pause you chose, then a mic that isn't delivering audio, then a warning.
+        /// Most important first: a pause you chose, then a mic that isn't delivering audio, then a warning, then sounds
+        /// that can't be recognized (so it never claims to watch for sirens it can't hear).
         static func make(paused: Bool, micTrouble: String?,
-                         warning: (what: String, azimuth: Double?, whereText: String, short: String, critical: Bool, endedAt: Date?)?) -> Self {
+                         warning: (what: String, azimuth: Double?, whereText: String, short: String, critical: Bool, endedAt: Date?)?,
+                         recognitionDown: Bool = false) -> Self {
             if paused { return Self(status: .paused, title: "Paused", detail: "Mic off. Resume here or in the app.") }
             if let micTrouble { return Self(status: .interrupted, title: "Not hearing anything", detail: micTrouble) }
             if let w = warning {
                 return Self(status: .warning, title: w.what, detail: w.whereText, azimuth: w.azimuth, short: w.short,
                             endedAt: w.endedAt, critical: w.critical)
+            }
+            if recognitionDown {
+                return Self(status: .limited, title: "Sirens & horns not recognized",
+                            detail: "iOS blocks sound recognition in the background. Open the app; \"getting closer\" still works.")
             }
             return Self(status: .listening, title: "Listening", detail: "Watching for horns, sirens and vehicles")
         }
@@ -46,6 +52,8 @@ nonisolated func radarActivitySelfCheck() {
     precondition(S.make(paused: false, micTrouble: "call", warning: horn).status == .interrupted, "no audio beats an old warning")
     precondition(S.make(paused: false, micTrouble: nil, warning: horn) == S(status: .warning, title: "Car horn", detail: "behind you", azimuth: 180, short: "Horn", critical: true))
     precondition(S.make(paused: false, micTrouble: nil, warning: nil).status == .listening)
+    precondition(S.make(paused: false, micTrouble: nil, warning: nil, recognitionDown: true).status == .limited, "never claim to watch for sirens it can't hear")
+    precondition(S.make(paused: false, micTrouble: nil, warning: horn, recognitionDown: true).status == .warning, "a warning still shows")
 
     let listening = S.make(paused: false, micTrouble: nil, warning: nil), hornNow = S.make(paused: false, micTrouble: nil, warning: horn)
     let siren = S.make(paused: false, micTrouble: nil, warning: (what: "Police siren", azimuth: 90, whereText: "on your left", short: "Siren", critical: true, endedAt: nil))

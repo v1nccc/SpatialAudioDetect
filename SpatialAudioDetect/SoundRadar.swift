@@ -1,5 +1,6 @@
 import ActivityKit
 @preconcurrency import AVFoundation
+import CoreML
 import CoreMotion
 import Observation
 import simd
@@ -9,7 +10,25 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     // All-around, then the beams ahead, left, behind, right; once per sound model (Debug › Sound model).
     let builtIn: [any SoundListener] = [SoundClassifier()] + beamAzimuths.indices.map { SoundClassifier(beam: $0) }
     let viaSoundML: [any SoundListener] = [SoundMLListener()] + beamAzimuths.indices.map { SoundMLListener(beam: $0) }
-    private var useSoundML = false  // capture queue only
+    /// Background test: our own Core ML sound model on the CPU and Neural Engine. CPU only still failed in the background
+    /// (its iOS-supplied feature extractor isn't ours to move); the Neural Engine is allowed there with the iOS 27
+    /// background-inference entitlement (SpatialAudioDetect.entitlements, once the account can sign it).
+    let viaCPUModel: [any SoundListener] = {
+        guard let url = Bundle.main.url(forResource: "SoundRadarCPUTest", withExtension: "mlmodelc") else { return [] }
+        let config = MLModelConfiguration()
+        config.computeUnits = .cpuAndNeuralEngine
+        return ([nil] + beamAzimuths.indices.map(Optional.some)).compactMap { beam in
+            (try? MLModel(contentsOf: url, configuration: config)).map { SoundClassifier(beam: beam, model: $0) }
+        }
+    }()
+    private var engine = SoundEngine.apple  // capture queue only
+    private var listeners: [any SoundListener] {
+        switch engine {
+        case .apple: builtIn
+        case .soundML: viaSoundML
+        case .cpuModel: viaCPUModel.count == builtIn.count ? viaCPUModel : builtIn
+        }
+    }
     let words = WordListener()
     private let steerLock = NSLock()
     private var steering: [SIMD3<Float>] = []
@@ -18,13 +37,19 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     func steer(_ weights: [SIMD3<Float>]) { steerLock.withLock { steering = weights } }
 
     /// Blocks the classifiers skipped because the phone couldn't keep up.
-    var droppedBlocks: Int { (builtIn + viaSoundML).map(\.droppedBlocks).reduce(0, +) }
+    var droppedBlocks: Int { (builtIn + viaSoundML + viaCPUModel).map(\.droppedBlocks).reduce(0, +) }
+
+    /// Fresh classifiers right away (e.g. back in the foreground after iOS refused them in the background). Capture queue.
+    func restartListeners() { listeners.forEach { $0.reset() } }
 
     /// Switch sound model; the newly used listeners start a fresh stream. Call on the capture queue.
+    /// The mic axis fix (Debug › Mic axis check). Capture queue.
+    func setAxes(_ axes: [SIMD3<Double>]) { maker.axes = axes }
+
     func use(_ engine: SoundEngine) {
-        guard (engine == .soundML) != useSoundML else { return }
-        useSoundML = engine == .soundML
-        (useSoundML ? viaSoundML : builtIn).forEach { $0.reset() }
+        guard engine != self.engine else { return }
+        self.engine = engine
+        listeners.forEach { $0.reset() }
     }
     var onBlock: (@Sendable (Block) -> Void)?
     private var maker = BlockMaker()  // one clock shared by direction and classifier
@@ -49,7 +74,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             let saved = (try? file?.write(from: buf)) != nil
             let made = maker.make(buf, savingAudio: saved, steering: steerLock.withLock { steering })
             onBlock?(made.block)
-            let listeners = useSoundML ? viaSoundML : builtIn
+            let listeners = listeners
             listeners[0].feed(made.omni, sampleRate: format.sampleRate, at: made.at)
             for (k, beam) in made.beams.enumerated() { listeners[k + 1].feed(beam, sampleRate: format.sampleRate, at: made.at) }
             words.feed(made.omni, sampleRate: format.sampleRate, at: made.block.start)
@@ -69,6 +94,13 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     var recordedFiles: [URL] = []  // last finished recording, for sharing
     var health = ""                  // processing: blocks per second, skipped blocks, phone temperature
     @ObservationIgnored private var blocksThisSecond = 0
+    @ObservationIgnored private var verdictsThisSecond = 0
+    @ObservationIgnored private var lastRestart = Date.distantPast
+    @ObservationIgnored private var silentSeconds = 0
+    @ObservationIgnored private var troubleLogged: [String: Date] = [:]
+    /// Audio is arriving but the classifier gives no verdicts: sirens and horns can't be recognized (iOS refuses Apple's
+    /// sound classifier in the background). Directions and "getting closer" still work.
+    private(set) var recognitionDown = false
     @ObservationIgnored private var lastThermal = ProcessInfo.ThermalState.nominal
     var wordStatus = "off"           // the name / danger-word listener
     var lastTranscript = ""          // what it last heard, to check it can understand the name
@@ -93,6 +125,33 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             queue.async { tap.use(engine) }
             log("sound model: \(engine.rawValue)")
         }
+    }
+
+    /// How the app's front/left/up are built from iOS's X/Y/Z on this iPhone (Debug › Mic axis check), kept across launches.
+    private(set) var axes: [SIMD3<Double>] = {
+        let v = UserDefaults.standard.array(forKey: "micAxes") as? [Double] ?? []
+        return v.count == 9 ? (0..<3).map { SIMD3(v[3 * $0], v[3 * $0 + 1], v[3 * $0 + 2]) } : identityAxes
+    }()
+    @ObservationIgnored private var probe: [Reading]?
+    @ObservationIgnored private var probeRoom: Double?
+    private(set) var probeRise: Double?  // during a mic axis check: loudest moment so far over the room, dB
+
+    func setAxes(_ axes: [SIMD3<Double>]) {
+        self.axes = axes
+        UserDefaults.standard.set(axes.flatMap { [$0.x, $0.y, $0.z] }, forKey: "micAxes")
+        let tap = tap
+        queue.async { tap.setAxes(axes) }
+        log("mic axes: \(axesText(axes))")
+    }
+
+    /// Mic axis check: where the next few seconds' loud sound comes from (any sound held next to one side of the phone).
+    func probeAxis(seconds: Double = 5) async -> (direction: SIMD3<Double>?, rise: Double) {
+        probeRoom = debug.map { $0.processed.hum ?? $0.processed.levelDB }  // the room's level before the probe sound starts
+        probeRise = nil
+        probe = []
+        try? await Task.sleep(for: .seconds(seconds))
+        defer { probe = nil; probeRise = nil }
+        return axisDirection(probe ?? [], room: probeRoom)
     }
 
     func setCalibration(offset: Double, mirror: Bool) {
@@ -202,9 +261,10 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             configured = true
         }
         problem = nil
-        let session = session, tap = tap, engine = engine
+        let session = session, tap = tap, engine = engine, axes = axes
         queue.async {
             tap.use(engine)
+            tap.setAxes(axes)
             session.startRunning()
         }
         listeningStarted = true
@@ -233,7 +293,22 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             guard let self else { return }
             Task { @MainActor in self.add(b) }
         }
-        for c in tap.builtIn + tap.viaSoundML {
+        let names = ["all-around"] + beamNames.map { "beam \($0)" }
+        for list in [tap.builtIn, tap.viaSoundML, tap.viaCPUModel] {
+            for (c, name) in zip(list, names) {
+                c.onTrouble = { [weak self] why in
+                    guard let self else { return }
+                    Task { @MainActor in
+                        EvalStore.shared.noteRestart()
+                        let key = name + why  // SoundML retries every block; one line per reason per 10 s is enough
+                        guard Date.now.timeIntervalSince(self.troubleLogged[key] ?? .distantPast) > 10 else { return }
+                        self.troubleLogged[key] = .now
+                        self.log("classifier \(name): \(why) (\(appState()))")
+                    }
+                }
+            }
+        }
+        for c in tap.builtIn + tap.viaSoundML + tap.viaCPUModel {
             c.onResult = { [weak self] heard in
                 guard let self else { return }
                 Task { @MainActor in self.hear(heard) }
@@ -295,8 +370,13 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             return Motion(gravity: g, yawRate: simd_dot(spin, -simd_normalize(g)))  // turning about the vertical
         } ?? Motion()
         lastBlockAt = .now
+        if probe != nil {
+            probe?.append(b.reading)
+            if let room = probeRoom { probeRise = max(probeRise ?? -.infinity, b.reading.db - room) }
+        }
         let pulse = detector.alertPulse
         let p = detector.add(b, motion: m)
+        EvalStore.shared.observe(detector.alert)  // evaluation session: record every alert and where it pointed
         tap.steer(detector.beamWeights)
         blocksThisSecond += 1
         react(since: pulse)
@@ -324,7 +404,9 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
 
     private func hear(_ h: Heard) {
         let pulse = detector.alertPulse
+        verdictsThisSecond += 1
         detector.hear(h)
+        EvalStore.shared.observe(detector.alert)
         react(since: pulse)
         recorder?.verdict(h, received: detector.clock)
         flushLog()
@@ -338,9 +420,14 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         let s = HapticSettings.load(), haptics = haptics
         let body = a.what + " " + directionWords(a.azimuth)
         let pattern = a.level == .critical ? s.critical : s.warning, title = a.level == .critical ? "Watch out" : "Heads up"
+        // Custom rhythms need Core Haptics, which iOS doesn't play for an app that isn't on screen (felt nothing while the
+        // app was only the Dynamic Island). There, use the system vibration in the same rhythm, coarser pulses.
+        let away = UIApplication.shared.applicationState != .active
+        let method = away && s.method == .coreHaptics ? .systemBuzz : s.method
         Task {
-            let r = await haptics.play(pattern, title: title, body: body, via: s.method)
-            if !r.ok { self.log("haptic \(s.method.name): \(r.detail) (\(appState()))") }
+            let r = await haptics.play(pattern, title: title, body: body, via: method)
+            EvalStore.shared.noteHaptic(ok: r.ok, detail: "\(method.name): \(r.detail.components(separatedBy: " · ").first ?? r.detail)")
+            if !r.ok { self.log("haptic \(method.name): \(r.detail) (\(appState()))") }
         }
         // ponytail: one notification per new warning or per 10 s, so a long siren doesn't flood the lock screen
         // The island pops open on its own (refreshActivity), so a notification on top would only double the buzz.
@@ -370,7 +457,13 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         }
         nc.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
-                if self?.micTrouble != nil { self?.restartCapture(because: "app opened") }
+                guard let self else { return }
+                if self.micTrouble != nil { self.restartCapture(because: "app opened") }
+                if self.recognitionDown {  // iOS lets the classifier run again in the foreground: don't wait for the backoff
+                    let tap = self.tap
+                    self.queue.async { tap.restartListeners() }
+                    self.log("app opened: restarting sound recognition")
+                }
             }
         }
         nc.addObserver(forName: UIApplication.willTerminateNotification, object: nil, queue: .main) { _ in
@@ -406,8 +499,9 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: nil, queue: .main) { [weak self] n in
             let error = (n.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.localizedDescription ?? "unknown"
             MainActor.assumeIsolated {
-                self?.log("mic capture error: \(error)")
-                self?.restartCapture(because: "capture error")
+                guard let self, Date.now.timeIntervalSince(self.lastRestart) >= 2 else { return }  // same error again: already retrying
+                self.log("mic capture error: \(error)")
+                self.restartCapture(because: "capture error")
             }
         }
         nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
@@ -421,8 +515,10 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         }
     }
 
+    /// At most once every 2 s: a session that keeps failing would otherwise retry (and log) hundreds of times a second.
     private func restartCapture(because why: String) {
-        guard listeningStarted, !paused else { return }
+        guard listeningStarted, !paused, Date.now.timeIntervalSince(lastRestart) >= 2 else { return }
+        lastRestart = .now
         log("restarting mic: \(why) (\(appState()))")
         lastBlockAt = .now
         let session = session
@@ -439,8 +535,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             lastThermal = thermal
         }
         let dropped = tap.droppedBlocks
-        health = "\(blocksThisSecond) blocks/s · \(dropped) skipped · \(heat)"
+        // Normal: ~47 blocks/s and 20 verdicts/s (5 listeners × 4). Blocks but no verdicts = the classifier stopped.
+        health = "\(blocksThisSecond) blocks/s · \(verdictsThisSecond) verdicts/s · \(dropped) skipped · \(heat)"
+        silentSeconds = blocksThisSecond >= 20 && verdictsThisSecond == 0 ? silentSeconds + 1 : 0
+        if (silentSeconds >= 2) != recognitionDown {
+            recognitionDown.toggle()
+            log(recognitionDown ? "sound recognition stopped (\(appState())): no verdicts while audio arrives" : "sound recognition working again")
+        }
+        EvalStore.shared.tick(listening: listeningStarted && !paused, recognitionDown: recognitionDown, micTrouble: micTrouble != nil, heat: heat)
         blocksThisSecond = 0
+        verdictsThisSecond = 0
         let trouble = micTrouble
         if trouble != lastTrouble {
             log(trouble.map { "mic trouble: \($0) (\(appState()))" } ?? "audio flowing again")
@@ -461,7 +565,8 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         return .make(paused: paused, micTrouble: micTrouble,
                      // 15° steps: the alert follows its sound every block; the island needn't update for each degree.
                      warning: held.map { ($0.alert.what, $0.alert.azimuth.map { ($0 / 15).rounded() * 15 }, directionWords($0.alert.azimuth), $0.alert.short,
-                                         $0.alert.level == .critical, $0.endedAt) })
+                                         $0.alert.level == .critical, $0.endedAt) },
+                     recognitionDown: recognitionDown)
     }
 
     /// While listening, the content goes stale 90 s after the last update, and updates come at least every 30 s,

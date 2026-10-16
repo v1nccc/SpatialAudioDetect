@@ -7,6 +7,7 @@ import SoundML
 nonisolated final class SoundMLListener: SoundListener, @unchecked Sendable {
     let beam: Int?
     var onResult: (@Sendable (Heard) -> Void)?
+    var onTrouble: (@Sendable (String) -> Void)?  // SoundML rebuilds its analyzer itself after a failure
     var droppedBlocks: Int { 0 }  // SoundML has no backlog limit: on a slow phone it falls behind instead of skipping
     private var analyzer: Analyzer?  // feed queue only
     private let lock = NSLock()
@@ -29,6 +30,7 @@ nonisolated final class SoundMLListener: SoundListener, @unchecked Sendable {
             }
             let id = a.id
             a.onUpdate = { [weak self] _, matches in self?.deliver(matches ?? [], from: id) }
+            a.onError = { [weak self] error in self?.onTrouble?("SoundML failed (\(error.localizedDescription))") }
             lock.withLock { stream = (id, Double(at) / sampleRate, 0) }
             analyzer = a
         }
