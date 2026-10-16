@@ -43,6 +43,9 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     func restartListeners() { listeners.forEach { $0.reset() } }
 
     /// Switch sound model; the newly used listeners start a fresh stream. Call on the capture queue.
+    /// The mic axis fix (Debug › Mic axis check). Capture queue.
+    func setAxes(_ axes: [SIMD3<Double>]) { maker.axes = axes }
+
     func use(_ engine: SoundEngine) {
         guard engine != self.engine else { return }
         self.engine = engine
@@ -92,6 +95,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     var health = ""                  // processing: blocks per second, skipped blocks, phone temperature
     @ObservationIgnored private var blocksThisSecond = 0
     @ObservationIgnored private var verdictsThisSecond = 0
+    @ObservationIgnored private var lastRestart = Date.distantPast
     @ObservationIgnored private var silentSeconds = 0
     @ObservationIgnored private var troubleLogged: [String: Date] = [:]
     /// Audio is arriving but the classifier gives no verdicts: sirens and horns can't be recognized (iOS refuses Apple's
@@ -121,6 +125,33 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             queue.async { tap.use(engine) }
             log("sound model: \(engine.rawValue)")
         }
+    }
+
+    /// How the app's front/left/up are built from iOS's X/Y/Z on this iPhone (Debug › Mic axis check), kept across launches.
+    private(set) var axes: [SIMD3<Double>] = {
+        let v = UserDefaults.standard.array(forKey: "micAxes") as? [Double] ?? []
+        return v.count == 9 ? (0..<3).map { SIMD3(v[3 * $0], v[3 * $0 + 1], v[3 * $0 + 2]) } : identityAxes
+    }()
+    @ObservationIgnored private var probe: [Reading]?
+    @ObservationIgnored private var probeRoom: Double?
+    private(set) var probeRise: Double?  // during a mic axis check: loudest moment so far over the room, dB
+
+    func setAxes(_ axes: [SIMD3<Double>]) {
+        self.axes = axes
+        UserDefaults.standard.set(axes.flatMap { [$0.x, $0.y, $0.z] }, forKey: "micAxes")
+        let tap = tap
+        queue.async { tap.setAxes(axes) }
+        log("mic axes: \(axesText(axes))")
+    }
+
+    /// Mic axis check: where the next few seconds' loud sound comes from (any sound held next to one side of the phone).
+    func probeAxis(seconds: Double = 5) async -> (direction: SIMD3<Double>?, rise: Double) {
+        probeRoom = debug.map { $0.processed.hum ?? $0.processed.levelDB }  // the room's level before the probe sound starts
+        probeRise = nil
+        probe = []
+        try? await Task.sleep(for: .seconds(seconds))
+        defer { probe = nil; probeRise = nil }
+        return axisDirection(probe ?? [], room: probeRoom)
     }
 
     func setCalibration(offset: Double, mirror: Bool) {
@@ -230,9 +261,10 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             configured = true
         }
         problem = nil
-        let session = session, tap = tap, engine = engine
+        let session = session, tap = tap, engine = engine, axes = axes
         queue.async {
             tap.use(engine)
+            tap.setAxes(axes)
             session.startRunning()
         }
         listeningStarted = true
@@ -338,6 +370,10 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             return Motion(gravity: g, yawRate: simd_dot(spin, -simd_normalize(g)))  // turning about the vertical
         } ?? Motion()
         lastBlockAt = .now
+        if probe != nil {
+            probe?.append(b.reading)
+            if let room = probeRoom { probeRise = max(probeRise ?? -.infinity, b.reading.db - room) }
+        }
         let pulse = detector.alertPulse
         let p = detector.add(b, motion: m)
         EvalStore.shared.observe(detector.alert)  // evaluation session: record every alert and where it pointed
@@ -463,8 +499,9 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         nc.addObserver(forName: AVCaptureSession.runtimeErrorNotification, object: nil, queue: .main) { [weak self] n in
             let error = (n.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.localizedDescription ?? "unknown"
             MainActor.assumeIsolated {
-                self?.log("mic capture error: \(error)")
-                self?.restartCapture(because: "capture error")
+                guard let self, Date.now.timeIntervalSince(self.lastRestart) >= 2 else { return }  // same error again: already retrying
+                self.log("mic capture error: \(error)")
+                self.restartCapture(because: "capture error")
             }
         }
         nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
@@ -478,8 +515,10 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         }
     }
 
+    /// At most once every 2 s: a session that keeps failing would otherwise retry (and log) hundreds of times a second.
     private func restartCapture(because why: String) {
-        guard listeningStarted, !paused else { return }
+        guard listeningStarted, !paused, Date.now.timeIntervalSince(lastRestart) >= 2 else { return }
+        lastRestart = .now
         log("restarting mic: \(why) (\(appState()))")
         lastBlockAt = .now
         let session = session

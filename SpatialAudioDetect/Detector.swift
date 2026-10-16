@@ -565,6 +565,9 @@ nonisolated struct Block: Sendable {
 nonisolated struct BlockMaker {
     // ponytail: below ~200 Hz it's mostly wind on the mics and engine rumble, which drag the direction around; tune with replay
     static let highPassHz = 200.0
+    /// Rows: how to build the app's (front, left, up) dipoles from the (X, Y, Z) iOS delivers. Identity = iOS uses the
+    /// orientation foaFront/foaLeft/foaUp assume; Debug › Mic axis check measures it on this iPhone.
+    var axes = identityAxes
     private var frames: AVAudioFramePosition = 0
     private var highPass: [HighPass] = []
     private let spectrum = Spectrum()
@@ -575,12 +578,14 @@ nonisolated struct BlockMaker {
         -> (block: Block, omni: [Float], beams: [[Float]], at: AVAudioFramePosition) {
         let format = buf.format, sr = format.sampleRate
         if highPass.isEmpty { highPass = (0..<4).compactMap { _ in HighPass(cutoff: Self.highPassHz, sampleRate: sr) } }
-        let raw = (0..<4).map { samples(buf, channel: $0) }
+        let raw = fixAxes((0..<4).map { samples(buf, channel: $0) }, axes)
         let ch = highPass.count == 4 ? (0..<4).map { highPass[$0].apply(raw[$0]) } : raw
         let kind = format.commonFormat == .pcmFormatFloat32 ? "float32" : format.commonFormat == .pcmFormatInt16 ? "int16" : "other"
+        let tag = format.channelLayout?.layoutTag
+        let layout = tag == kAudioChannelLayoutTag_HOA_ACN_SN3D | 4 ? "ACN/SN3D" : tag.map { "layout 0x\(String($0, radix: 16)) (not ACN/SN3D!)" } ?? "no channel layout (order unknown!)"
         let block = Block(reading: foaReading(w: ch[0], y: ch[1], z: ch[2], x: ch[3]),
                           start: Double(frames) / sr, duration: Double(buf.frameLength) / sr,
-                          format: "\(Int(sr)) Hz · \(format.channelCount) ch · \(kind)\(format.isInterleaved ? " interleaved" : "") · \(buf.frameLength) frames",
+                          format: "\(Int(sr)) Hz · \(format.channelCount) ch · \(layout) · \(kind)\(format.isInterleaved ? " interleaved" : "") · \(buf.frameLength) frames",
                           savingAudio: savingAudio, bins: binIntensities(ch, sampleRate: sr, spectrum: spectrum))
         let at = frames
         frames += AVAudioFramePosition(buf.frameLength)
@@ -599,6 +604,66 @@ nonisolated struct BlockMaker {
         }
         return []
     }
+}
+
+nonisolated let identityAxes: [SIMD3<Double>] = [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)]
+
+/// Channels W, Y, Z, X with the dipoles rebuilt by `axes` (rows: new front, left, up from the delivered X, Y, Z).
+nonisolated func fixAxes(_ ch: [[Float]], _ axes: [SIMD3<Double>]) -> [[Float]] {
+    guard axes != identityAxes, ch.count == 4 else { return ch }
+    let dipoles = [ch[3], ch[1], ch[2]]  // X, Y, Z
+    let fixed = axes.map { row in
+        (0..<3).filter { row[$0] != 0 }.reduce([Float](repeating: 0, count: ch[0].count)) { acc, a in
+            vDSP.add(multiplication: (dipoles[a], Float(row[a])), acc)
+        }
+    }
+    return [ch[0], fixed[1], fixed[2], fixed[0]]
+}
+
+/// Rise over the room needed for a probe moment to count: a voice or phone speaker ~5 cm away is easily 15–30 dB over a
+/// quiet room. ponytail: set without a real iPhone; lower it if ordinary talking 5 cm away doesn't reach it.
+nonisolated let probeRiseDB = 8.0
+
+/// Where a probe came from (any sound held close to one side of the phone: talking, humming, a video on another phone,
+/// snaps), in the app's front/left/up frame: the direction of every moment ≥ probeRiseDB over the room (`room`, the
+/// street hum measured before; else the probe's own quietest fifth), summed and normalized. Nil with fewer than 3 such
+/// moments (~64 ms). `rise` = the loudest moment over the room, for "louder, closer" feedback.
+nonisolated func axisDirection(_ readings: [Reading], room: Double? = nil) -> (direction: SIMD3<Double>?, rise: Double) {
+    guard !readings.isEmpty else { return (nil, -.infinity) }
+    let floor = room ?? readings.map(\.db).sorted()[readings.count / 5]
+    let loud = readings.filter { $0.db >= floor + probeRiseDB && $0.ww > 0 }
+    let v = loud.reduce(SIMD3<Double>.zero) { $0 + SIMD3($1.wx, $1.wy, $1.wz) / $1.ww }
+    let rise = (readings.map(\.db).max() ?? floor) - floor
+    return (loud.count >= 3 && simd_length(v) > 0 ? v / simd_length(v) : nil, rise)
+}
+
+/// The axis swap (signed permutation, as rows) that makes probes read as the app assumes: a sound at the back (camera
+/// side) = front, at the left edge (looking at the screen) = left, at the top edge = up. Nil when a probe is unclear
+/// (< 0.5 on its main axis) or two probes land on the same axis.
+nonisolated func axisSwap(back: SIMD3<Double>, left: SIMD3<Double>, top: SIMD3<Double>) -> [SIMD3<Double>]? {
+    var rows: [SIMD3<Double>] = [], used = Set<Int>()
+    for m in [back, left, top] {
+        let a = (0..<3).max { abs(m[$0]) < abs(m[$1]) }!
+        guard abs(m[a]) >= 0.5, used.insert(a).inserted else { return nil }
+        var row = SIMD3<Double>.zero
+        row[a] = m[a] > 0 ? 1 : -1
+        rows.append(row)
+    }
+    return rows
+}
+
+/// `p` applied after `old` (both as rows): new[i] = Σ p[i][j] · old[j].
+nonisolated func composeAxes(_ p: [SIMD3<Double>], _ old: [SIMD3<Double>]) -> [SIMD3<Double>] {
+    p.map { row in (0..<3).reduce(SIMD3<Double>.zero) { $0 + row[$1] * old[$1] } }
+}
+
+/// "front ← +Z, left ← −X, up ← +Y" (which delivered channel each of the app's dipoles uses).
+nonisolated func axesText(_ axes: [SIMD3<Double>]) -> String {
+    guard axes != identityAxes else { return "as assumed (front ← X, left ← Y, up ← Z)" }
+    return zip(["front", "left", "up"], axes).map { name, row in
+        let a = (0..<3).max { abs(row[$0]) < abs(row[$1]) }!
+        return "\(name) ← \(row[a] < 0 ? "−" : "+")\(["X", "Y", "Z"][a])"
+    }.joined(separator: ", ")
 }
 
 /// Phone motion at one block.
@@ -1043,6 +1108,23 @@ nonisolated func selfCheck() {
     precondition(abs(metersFromLevel(-42, reference: -30, at: 1) - 3.98) < 0.01, "12 dB quieter = 4x as far")
 
     let s = (0..<4800).map { Float(sin(Double($0) * 0.3)) }, zero = s.map { _ in Float(0) }
+    // Mic axis check: an iPhone whose iOS "front" is our up, "left" our right, "up" our front is found and fixed.
+    let swap = axisSwap(back: SIMD3(0.1, 0, 0.9), left: SIMD3(0, -0.85, 0.1), top: SIMD3(0.92, 0.1, 0))!
+    precondition(swap == [SIMD3(0, 0, 1), SIMD3(0, -1, 0), SIMD3(1, 0, 0)], "axis swap -> \(swap)")
+    precondition(axisSwap(back: SIMD3(1, 0, 0), left: SIMD3(0.9, 0.2, 0), top: SIMD3(0, 0, 1)) == nil, "two probes on one axis: unclear")
+    precondition(composeAxes(swap, identityAxes) == swap && composeAxes(swap, swap) == [SIMD3(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1)],
+                 "this swap undone by itself")
+    let delivered = [s, s.map { -$0 * 0.5 }, zero, zero]  // W, Y, Z, X: a sound the wrong iOS frame calls "right"
+    let fixedCh = fixAxes(delivered, swap)
+    precondition(fixedCh[1] == s.map { $0 * 0.5 } && fixedCh[3] == zero, "after the fix it's on the left")
+    let probe = (0..<40).map { k in k % 10 == 0 ? Reading(ww: 1, wx: 0, wy: 0.9, wz: 0.1) : Reading(ww: 0.001, wx: 0.0008, wy: 0, wz: 0) }
+    precondition(axisDirection(probe).direction.map { $0.y > 0.95 } == true, "snaps on the left, quiet hum ahead -> left")
+    let talking = (0..<100).map { _ in Reading(ww: 1, wx: 0, wy: 0, wz: 0.8) }  // a steady voice at the top edge, all along
+    precondition(axisDirection(talking, room: -40).direction.map { $0.z > 0.95 } == true, "continuous sound over the room -> top")
+    let quietTalk = (0..<100).map { _ in Reading(ww: 0.001, wx: 0, wy: 0, wz: 0.0008) }  // -30 dB: only 10 dB over a -40 room
+    precondition(axisDirection(quietTalk, room: -35).direction == nil && abs(axisDirection(quietTalk, room: -35).rise - 5) < 0.1,
+                 "too quiet: no direction, and how far it got")
+
     let upright = SIMD3<Double>(0, -1, 0), flat = SIMD3<Double>(0, 0, -1), tilted = SIMD3<Double>(0, -0.707, -0.707)
     for deg in [0.0, 45, 90, 180, -90] {
         let a = deg * .pi / 180
