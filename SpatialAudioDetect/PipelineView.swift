@@ -175,12 +175,11 @@ struct PipelineView: View {
                 check("Rose ≥ \(f(rule.riseDB, 0)) dB in \(f(rule.window, 0)) s", "\(f(st.rise, 1)) dB", st.rise >= rule.riseDB)
                 check("Steadily (no jump > half the rise)", "\(f(st.biggestJump, 1)) dB", st.biggestJump <= st.rise / 2)
                 check("≥ \(f(rule.leadDB, 0)) dB above the other directions", "\(f(st.lead, 1)) dB", st.lead >= rule.leadDB)
-                check("Louder than \(Int(rule.minDB)) dB", "\(f(st.db, 0)) dB", st.db > rule.minDB)
                 check("Out of your view (left, behind, right)", pretty(sectorNames[i]), Detector.warnSectors.contains(i))
                 if let usual = d.processed.usual {
-                    check("≥ \(f(Detector.standOutDB, 0)) dB over this street's usual", "\(s(st.db - usual, 0)) dB", st.db - usual >= Detector.standOutDB)
+                    check("At least as loud as this street usually is (\(s(Detector.standOutDB, 0)) dB)", "\(s(st.db - usual, 0)) dB", st.db - usual >= Detector.standOutDB)
                 }
-                check("Stood out for ≥ 1 s", "\(f(st.ledFor, 2)) s", st.ledFor >= 1)
+                check("Stood out for ≥ \(f(Detector.settleSeconds, 1)) s", "\(f(st.ledFor, 2)) s", st.ledFor >= Detector.settleSeconds)
                 check("Bearing moving ≤ \(Int(Detector.maxSweep))°/s (coming at you, not passing)", "\(Int(sweep.rounded()))°/s", sweep <= Detector.maxSweep)
             }
         }

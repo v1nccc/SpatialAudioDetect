@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		000000000000000160000000 /* SoundRadarWidget.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 000000000000000000000230 /* SoundRadarWidget.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		000000000000000310000000 /* SoundML in Frameworks */ = {isa = PBXBuildFile; productRef = 000000000000000320000000 /* SoundML */; };
+		BF3C91D8308220F500C379DB /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = BF3C91D7308220F500C379DB /* AppIcon.icon */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -36,6 +37,7 @@
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* SpatialAudioDetect.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SpatialAudioDetect.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		000000000000000000000230 /* SoundRadarWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = SoundRadarWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		BF3C91D7308220F500C379DB /* AppIcon.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = AppIcon.icon; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -78,6 +80,7 @@
 				000000000000000000000220 /* Shared */,
 				000000000000000000000210 /* SoundRadarWidget */,
 				000000000000000000000020 /* Products */,
+				BF3C91D7308220F500C379DB /* AppIcon.icon */,
 			);
 			sourceTree = "<group>";
 		};
@@ -180,6 +183,7 @@
 		000000000000000140000000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			files = (
+				BF3C91D8308220F500C379DB /* AppIcon.icon in Resources */,
 			);
 		};
 		000000000000000240000000 /* Resources */ = {

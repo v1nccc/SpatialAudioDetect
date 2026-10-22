@@ -422,7 +422,7 @@ nonisolated func secondsToReach(risingDBPerSecond rate: Double) -> Double? {
 /// The rise is measured over the last second after 0.3 s smoothing, i.e. it describes ~0.8 s ago.
 nonisolated func reachEstimate(_ stats: [ApproachDetector.SectorStat]) -> (sector: Int, seconds: Double)? {
     let rule = ApproachDetector()
-    let candidates = stats.indices.filter { stats[$0].lead >= rule.leadDB && stats[$0].db > rule.minDB && stats[$0].recentRise > 0.5 }
+    let candidates = stats.indices.filter { stats[$0].lead >= rule.leadDB && stats[$0].recentRise > 0.5 }
     guard let s = candidates.max(by: { stats[$0].db < stats[$1].db }),
           let secs = secondsToReach(risingDBPerSecond: stats[s].recentRise) else { return nil }
     return (s, max(secs - 0.8, 0))
@@ -442,10 +442,13 @@ nonisolated let sectorNames = ["ahead", "ahead-left", "left", "behind-left", "be
 /// while louder traffic elsewhere dominates.
 nonisolated struct ApproachDetector {
     static let sectors = 8
-    // ponytail: thresholds are guesses, not measured; tune them with Tools/replay.swift on a real road
-    var minDB = -50.0   // ignore anything quieter
-    var riseDB = 6.0    // must get this much louder…
-    var window = 2.0    // …over this many seconds, spread out rather than in one jump
+    // ponytail: set on synthetic motorcycles (30–50 km/h, quiet to busy streets); tune with Tools/replay.swift on a real road.
+    // A vehicle coming at you gets louder by 8.7 ÷ (seconds until it reaches you) dB per second: slowly while far, fast at
+    // the end. 3 dB over 3 s catches a 30 km/h motorcycle ~6 s (50 m) away on a quiet street; the old 6 dB in 2 s only
+    // ~1 s away. No fixed loudness floor: the old −50 dBFS one hid every vehicle until ~15 m; Detector.standOutDB
+    // compares with this street's own level instead.
+    var riseDB = 3.0    // must get this much louder…
+    var window = 3.0    // …over this many seconds, spread out rather than in one jump
     var leadDB = 3.0    // and stand this far above the median direction (not the whole street rising)
     private let tick = 0.25
     private var power = [Double](repeating: 0, count: sectors)
@@ -482,7 +485,7 @@ nonisolated struct ApproachDetector {
             let led = (0..<n).reversed().prefix { l[$0] - medians[$0] >= leadDB }.count
             return SectorStat(db: l[n - 1], rise: rise, biggestJump: jump, lead: lead, sweep: sweep,
                               recentRise: l[n - 1] - l[n - 1 - back], ledFor: Double(led) * tick,
-                              approaching: l[n - 1] > minDB && rise >= riseDB && jump <= rise / 2 && lead >= leadDB)
+                              approaching: rise >= riseDB && jump <= rise / 2 && lead >= leadDB)
         }
     }
 
@@ -737,8 +740,13 @@ nonisolated struct DebugSnapshot: Sendable {
 nonisolated struct Detector {
     /// "Getting closer" only warns out of the runner's view: left, behind-left, behind, behind-right, right.
     static let warnSectors: Set<Int> = [2, 3, 4, 5, 6]
-    // ponytail: guess; tune with Tools/replay.swift on recorded walks
-    static let standOutDB = 6.0  // an approaching sound must be this much louder than the street's usual level
+    // ponytail: set on synthetic motorcycles; tune with Tools/replay.swift on recorded walks.
+    // An approaching sound's beam must be at least this loud compared with the whole street's usual level. A beam hears
+    // only about a quarter of the street's background, so 0 dB here already means it clearly stands out in its direction;
+    // the old +6 dB was only reached ~1 s before a vehicle arrived.
+    static let standOutDB = 0.0
+    /// Seconds a direction must have stood out from the others before its bearing is trusted.
+    static let settleSeconds = 0.5
     // °/s: bearing moving faster than this while it gets louder = passing by, not coming at you. Bearing rate is
     // speed × side-offset ÷ distance²: at 6 m, a vehicle on your line (≤1 m off) moves ~13°/s, a road car 4 m off ~40°/s.
     static let maxSweep = 20.0
@@ -1003,8 +1011,8 @@ nonisolated struct Detector {
             if let usual, stats[s].db - usual < Self.standOutDB {
                 return ("usual", String(format: "only %+.0f dB over usual", stats[s].db - usual))
             }
-            // Judge the bearing only once this direction has clearly stood out for a second, not while it emerges from the hum.
-            if stats[s].ledFor < 1 { return ("settling", "(bearing not settled yet)") }
+            // Judge the bearing only once this direction has clearly stood out a moment, not while it emerges from the hum.
+            if stats[s].ledFor < Self.settleSeconds { return ("settling", "(bearing not settled yet)") }
             // A car spans neighbouring beams, so take the fastest sweep across this sector and its two neighbours.
             let n = ApproachDetector.sectors, sweep = [n - 1, 0, 1].map { stats[(s + $0) % n].sweep }.max()!
             if sweep > Self.maxSweep { return ("passing", String(format: "passing by (bearing moving ~%.0f°/s)", sweep)) }
@@ -1208,6 +1216,16 @@ nonisolated func selfCheck() {
     // A car on the road beside you sweeps past at ~25°/s when it's ~8 m away (4 m to the side).
     let passing = approachWarned(from: { 240 - 24 * ($0 - 18) }, street: -50, then: -50, rampTo: -20)
     precondition(!passing.warned && passing.log.contains { $0.contains("passing by") }, "a car sweeping past isn't coming at you -> \(passing.log)")
+    // A motorcycle at 30 km/h (8.3 m/s) coming up behind you on a quiet street, no horn: warned ≥ 4 s before it reaches you.
+    // (0 dB at 10 m, street 20 dB quieter; it reaches you at t = 30.)
+    var bike = Detector(), bikeWarnedAt: Double?
+    for k in 0..<1500 {
+        let t = Double(k) * 0.02, metres = max(8.3 * (30 - t), 1.5)
+        bike.add(Block(reading: plane(-40 + 20 * log10(10 / metres), from: 180, bed: -60), start: t, duration: 0.02, format: "", savingAudio: false),
+                 motion: Motion())
+        if bikeWarnedAt == nil, bike.alert?.what.contains("getting closer") == true { bikeWarnedAt = t }
+    }
+    precondition((bikeWarnedAt ?? 99) <= 26, "motorcycle from behind should warn ≥ 4 s ahead -> \(bikeWarnedAt.map { "\(30 - $0) s before" } ?? "never")")
 
     // Arm swing: a fixed sound behind stays put while the phone swings ±25° at 1.5 Hz; a real 90° turn is followed.
     var smoother = HeadingSmoother(), worst = 0.0

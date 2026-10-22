@@ -223,7 +223,7 @@ struct DebugView: View {
         } header: {
             Text("⑦ Getting-closer detector (a beam per 45° sector)")
         } footer: {
-            Text("Getting closer = rose ≥ \(f(rule.riseDB, 0)) dB in \(f(rule.window, 0)) s without one big jump, and \(f(rule.leadDB, 0)) dB above the other directions. It only warns ⚠️ if it is also out of view (left, behind or right; 👁 otherwise), ≥ \(f(Detector.standOutDB, 0)) dB over this street's usual level (🔈 otherwise), stood out for 1 s (⏳), and its bearing moves ≤ \(f(Detector.maxSweep, 0))°/s; faster = passing by (↔). Not while the classifier says people or an alert sound.")
+            Text("Getting closer = rose ≥ \(f(rule.riseDB, 0)) dB in \(f(rule.window, 0)) s without one big jump, and \(f(rule.leadDB, 0)) dB above the other directions. It only warns ⚠️ if it is also out of view (left, behind or right; 👁 otherwise), at least as loud as this street usually is (🔈 otherwise), stood out for \(f(Detector.settleSeconds, 1)) s (⏳), and its bearing moves ≤ \(f(Detector.maxSweep, 0))°/s; faster = passing by (↔). Not while the classifier says people or an alert sound.")
         }
     }
 
