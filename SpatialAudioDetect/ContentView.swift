@@ -17,8 +17,14 @@ extension SoundKind {
     }
 }
 
+enum AppTab: String {
+    case soundRadar
+    case camera
+}
+
 struct ContentView: View {
     @State private var radar = SoundRadar.shared
+    @State private var selectedTab: AppTab = .soundRadar
     @State private var debugging = false
     @State private var tuningHaptics = false
     @State private var explaining = false
@@ -28,31 +34,45 @@ struct ContentView: View {
     @AppStorage("mirror") private var mirror = false
 
     var body: some View {
-        NavigationStack {
-            VStack(spacing: 16) {
-                statusCard
-                radarCard
-                controls
-                Spacer(minLength: 0)
-            }
-            .padding()
-            .background { (radar.alert?.level.color ?? Color(.systemGroupedBackground)).ignoresSafeArea() }
-            .navigationTitle("Sound Radar")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("How it's measured", systemImage: "function") { explaining = true }
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                VStack(spacing: 16) {
+                    statusCard
+                    radarCard
+                    controls
+                    Spacer(minLength: 0)
                 }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button("Evaluate", systemImage: "checklist") { evaluating = true }
-                    Button("Alerts", systemImage: "bell.badge") { tuningHaptics = true }
-                    Button("Debug", systemImage: "ladybug") { debugging = true }
+                .padding()
+                .background { (radar.alert?.level.color ?? Color(.systemGroupedBackground)).ignoresSafeArea() }
+                .navigationTitle("Sound Radar")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("How it's measured", systemImage: "function") { explaining = true }
+                    }
+                    ToolbarItemGroup(placement: .topBarTrailing) {
+                        Button("Evaluate", systemImage: "checklist") { evaluating = true }
+                        Button("Alerts", systemImage: "bell.badge") { tuningHaptics = true }
+                        Button("Debug", systemImage: "ladybug") { debugging = true }
+                    }
                 }
+                .sheet(isPresented: $debugging) { DebugView(radar: radar, offset: $offset, mirror: $mirror) }
+                .sheet(isPresented: $tuningHaptics) { HapticsView(radar: radar) }
+                .sheet(isPresented: $explaining) { PipelineView(radar: radar) }
+                .sheet(isPresented: $evaluating) { EvaluationView(radar: radar) }
             }
-            .sheet(isPresented: $debugging) { DebugView(radar: radar, offset: $offset, mirror: $mirror) }
-            .sheet(isPresented: $tuningHaptics) { HapticsView(radar: radar) }
-            .sheet(isPresented: $explaining) { PipelineView(radar: radar) }
-            .sheet(isPresented: $evaluating) { EvaluationView(radar: radar) }
+            .tabItem {
+                Label("Sound Radar", systemImage: "dot.radiowaves.left.and.right")
+            }
+            .tag(AppTab.soundRadar)
+
+            NavigationStack {
+                CameraView(radar: radar)
+            }
+            .tabItem {
+                Label("Camera", systemImage: "camera.viewfinder")
+            }
+            .tag(AppTab.camera)
         }
         .onChange(of: offset, initial: true) { radar.setCalibration(offset: offset, mirror: mirror) }
         .onChange(of: mirror) { radar.setCalibration(offset: offset, mirror: mirror) }

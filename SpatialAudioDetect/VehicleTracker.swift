@@ -85,6 +85,69 @@ nonisolated enum DistanceMethod: String, CaseIterable, Sendable {
 nonisolated let vehicleHeights: [String: Double] = ["car": 1.5, "motorcycle": 1.45, "bicycle": 1.7, "bus": 3.1, "truck": 3.0, "person": 1.7]
 nonisolated let vehicleWidths: [String: Double] = ["car": 1.8, "motorcycle": 0.8, "bicycle": 0.6, "bus": 2.55, "truck": 2.5, "person": 0.5]
 
+/// Road objects that the camera can detect, measure distance for, and warn about.
+nonisolated enum DetectableObject: String, CaseIterable, Sendable, Codable, Identifiable {
+    case car = "car"
+    case motorcycle = "motorcycle"
+    case bicycle = "bicycle"
+    case bus = "bus"
+    case truck = "truck"
+    case person = "person"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .car: "Car"
+        case .motorcycle: "Motorcycle"
+        case .bicycle: "Bicycle"
+        case .bus: "Bus"
+        case .truck: "Truck"
+        case .person: "Person"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .car: "car.fill"
+        case .motorcycle: "scooter"
+        case .bicycle: "bicycle"
+        case .bus: "bus.fill"
+        case .truck: "box.truck.fill"
+        case .person: "figure.walk"
+        }
+    }
+
+    var typicalHeight: Double { vehicleHeights[rawValue] ?? 1.5 }
+    var typicalWidth: Double { vehicleWidths[rawValue] ?? 1.5 }
+}
+
+/// User-configurable settings for what objects to detect/measure, which ones raise warnings, and thresholds.
+nonisolated struct CameraSettings: Sendable, Codable, Equatable {
+    var enabledObjects: Set<String> = Set(DetectableObject.allCases.map(\.rawValue))
+    var warnObjects: Set<String> = ["car", "motorcycle", "bicycle", "bus", "truck"]
+    var warnSeconds: Double = VehicleTracker.warnSeconds
+    var warnSide: Double = VehicleTracker.warnSide
+    var startConfidence: Double = VehicleTracker.startConfidence
+    var mergeRiderWithVehicle: Bool = true
+
+    private static let storageKey = "cameraSettings"
+
+    static func load() -> CameraSettings {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let decoded = try? JSONDecoder().decode(CameraSettings.self, from: data) else {
+            return CameraSettings()
+        }
+        return decoded
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: Self.storageKey)
+        }
+    }
+}
+
 /// The same thing under the label each model uses (Apple's YOLOv3 says "motorbike", YOLO26 "motorcycle").
 nonisolated func normalizedLabel(_ label: String) -> String { label == "motorbike" ? "motorcycle" : label }
 
@@ -171,20 +234,29 @@ nonisolated struct VehicleTracker {
 
     /// One frame's detections at stream time `t`.
     mutating func update(_ raw: [VehicleDetection], at t: Double, camera: CameraIntrinsics, road: GroundPlane? = nil,
-                         method: DistanceMethod = .calculation) -> [VehicleTrack] {
+                         method: DistanceMethod = .calculation, settings: CameraSettings = CameraSettings()) -> [VehicleTrack] {
         var detections = raw.map { d -> VehicleDetection in
             var d = d
             d.label = normalizedLabel(d.label)
             return d
-        }.filter { vehicleHeights[$0.label] != nil && $0.confidence >= Self.keepConfidence && ($0.lidar ?? 1) >= Self.lensBlocked }
-        // A motorbike or bicycle rider is also found as a person: keep just the vehicle.
-        let rides = detections.filter { $0.label == "motorcycle" || $0.label == "bicycle" }.map(\.rect)
-        detections.removeAll { d in
-            d.label == "person" && rides.contains { r in
-                let inter = r.intersection(d.rect)
-                return !inter.isNull && inter.width * inter.height >= 0.5 * d.rect.width * d.rect.height
+        }.filter {
+            vehicleHeights[$0.label] != nil
+                && settings.enabledObjects.contains($0.label)
+                && $0.confidence >= Self.keepConfidence
+                && ($0.lidar ?? 1) >= Self.lensBlocked
+        }
+        // A motorbike or bicycle rider is also found as a person: keep just the vehicle when enabled.
+        if settings.mergeRiderWithVehicle {
+            let rides = detections.filter { $0.label == "motorcycle" || $0.label == "bicycle" }.map(\.rect)
+            detections.removeAll { d in
+                d.label == "person" && rides.contains { r in
+                    let inter = r.intersection(d.rect)
+                    return !inter.isNull && inter.width * inter.height >= 0.5 * d.rect.width * d.rect.height
+                }
             }
         }
+        // Remove existing tracks whose object type was turned off in settings.
+        tracks.removeAll { !settings.enabledObjects.contains($0.label) }
         // Greedy by overlap: each track takes the detection that overlaps it most (labels may flicker car ↔ truck).
         for i in tracks.indices {
             func iou(_ d: VehicleDetection) -> Double {
@@ -194,19 +266,19 @@ nonisolated struct VehicleTracker {
                 return Double(x / (a.width * a.height + b.width * b.height - x))
             }
             guard let j = detections.indices.max(by: { iou(detections[$0]) < iou(detections[$1]) }), iou(detections[j]) >= 0.25 else { continue }
-            add(detections.remove(at: j), to: i, at: t, camera: camera, road: road, method: method)
+            add(detections.remove(at: j), to: i, at: t, camera: camera, road: road, method: method, settings: settings)
         }
-        for d in detections where d.confidence >= Self.startConfidence {
+        for d in detections where d.confidence >= settings.startConfidence {
             tracks.append(VehicleTrack(id: nextID, label: d.label, confidence: d.confidence, rect: d.rect, lastSeen: t))
             nextID += 1
-            add(d, to: tracks.count - 1, at: t, camera: camera, road: road, method: method)
+            add(d, to: tracks.count - 1, at: t, camera: camera, road: road, method: method, settings: settings)
         }
         tracks.removeAll { t - $0.lastSeen > 1 }
         return tracks
     }
 
     private mutating func add(_ d: VehicleDetection, to i: Int, at t: Double, camera: CameraIntrinsics, road: GroundPlane?,
-                              method: DistanceMethod) {
+                              method: DistanceMethod, settings: CameraSettings) {
         var k = tracks[i]
         let dt = k.hits == 0 ? 0 : t - k.lastSeen
         if d.confidence >= k.confidence - 0.1 { k.label = d.label }
@@ -269,8 +341,8 @@ nonisolated struct VehicleTracker {
         let lag = t - window.map(\.t).reduce(0, +) / Double(max(window.count, 1))
         k.timeToReach = growth.flatMap { $0 > 1 / 10 ? max(1 / $0 - lag, 0) : nil }
         let closingNear = k.fromLidar && k.distance! <= 3 && (k.closingSpeed ?? 0) > 1
-        k.warn = k.confirmed && k.label != "person"
-            && (((k.timeToReach ?? .infinity) <= Self.warnSeconds && abs(k.lateral ?? 0) <= Self.warnSide) || closingNear)
+        k.warn = k.confirmed && settings.warnObjects.contains(k.label)
+            && (((k.timeToReach ?? .infinity) <= settings.warnSeconds && abs(k.lateral ?? 0) <= settings.warnSide) || closingNear)
         tracks[i] = k
     }
 }
@@ -388,4 +460,15 @@ nonisolated func vehicleTrackerSelfCheck() {
     }
     precondition(abs(vanAt20!.learnedHeight! - 1.9) < 0.05 && abs(vanAt20!.sizeDistance! - 20) < 1, "learned 1.9 m height -> \(vanAt20!)")
     precondition(abs(vanAt20!.widthDistance! - 20) < 1, "known width: 1.8 m wide car at 20 m -> \(vanAt20!.widthDistance!)")
+
+    // Custom settings: only detect selected objects, and optionally allow person warnings.
+    var customSettings = CameraSettings()
+    customSettings.enabledObjects = ["bicycle", "person"]
+    customSettings.warnObjects = ["bicycle", "person"]
+    var customTracker = VehicleTracker()
+    let filtered = customTracker.update([
+        VehicleDetection(label: "car", confidence: 0.9, rect: box(distance: 5, left: 0, height: 1.5)),
+        VehicleDetection(label: "bicycle", confidence: 0.9, rect: box(distance: 5, left: 0, height: 1.7))
+    ], at: 0, camera: camera, settings: customSettings)
+    precondition(filtered.count == 1 && filtered[0].label == "bicycle", "disabled car filtered out -> \(filtered)")
 }

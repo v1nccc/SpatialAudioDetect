@@ -68,6 +68,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
     var onFrame: (@Sendable (CameraFrame) -> Void)?
     var lens = CameraIntrinsics()     // in the sensor's own image; from the lens until LiDAR calibration data arrives
     var method = DistanceMethod.calculation  // camera queue, like everything below
+    var settings = CameraSettings()          // camera queue: which objects to detect, warn on, and thresholds
     private var rotation = PictureRotation.portrait  // how the phone is held, from gravity
     private let motion = CMMotionManager()
     private(set) var detector = CameraDetector.yolo26Large
@@ -181,7 +182,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
             }
         }
         let ms = (CACurrentMediaTime() - start) * 1000
-        let tracks = tracker.update(found, at: t, camera: camera, road: road?.plane, method: method)
+        let tracks = tracker.update(found, at: t, camera: camera, road: road?.plane, method: method, settings: settings)
         if let folder = recordTo, recorder == nil {
             recorder = try? CameraRecorder(folder: folder, width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels),
                                            rotation: rotation)
@@ -282,19 +283,39 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
     private(set) var road = "–"
     private(set) var rotation = PictureRotation.portrait
     /// Which vision model finds the vehicles.
-    var detector = CameraDetector.yolo26Large {
+    var detector: CameraDetector = {
+        if let raw = UserDefaults.standard.string(forKey: "cameraDetector"),
+           let d = CameraDetector(rawValue: raw) { return d }
+        return .yolo26Large
+    }() {
         didSet {
+            UserDefaults.standard.set(detector.rawValue, forKey: "cameraDetector")
             guard let worker else { return }
             let d = detector
             queue.async { worker.use(d) }
         }
     }
     /// How distance is worked out (all are recorded; this one is shown and used). Depth Anything only runs in its mode.
-    var method = DistanceMethod.calculation {
+    var method: DistanceMethod = {
+        if let raw = UserDefaults.standard.string(forKey: "cameraDistanceMethod"),
+           let m = DistanceMethod(rawValue: raw) { return m }
+        return .calculation
+    }() {
         didSet {
+            UserDefaults.standard.set(method.rawValue, forKey: "cameraDistanceMethod")
             guard let worker else { return }
             let m = method
             queue.async { worker.method = m }
+        }
+    }
+    /// Configurable object selection, warning objects, and warning thresholds.
+    var settings = CameraSettings.load() {
+        didSet {
+            settings.save()
+            let s = settings
+            tracks.removeAll { !s.enabledObjects.contains($0.label) }
+            guard let worker else { return }
+            queue.async { worker.settings = s }
         }
     }
     private(set) var recording = false
@@ -365,6 +386,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         let worker = CameraWorker(depthModel: depthModel)
         if !worker.use(detector) { problem = "The \(detector.rawValue) model is missing from the app" }
         worker.method = method
+        worker.settings = settings
 
         session.beginConfiguration()
         session.automaticallyConfiguresApplicationAudioSession = false  // leave the radar's microphone alone
@@ -512,33 +534,275 @@ struct CameraPreview: UIViewRepresentable {
     func updateUIView(_ view: CameraPreviewView, context: Context) { view.show(tracks, rotation: rotation) }
 }
 
+enum CameraSubTab: String, CaseIterable, Identifiable {
+    case live = "Live"
+    case detections = "Detections"
+    case settings = "Settings"
+
+    var id: String { rawValue }
+    var icon: String {
+        switch self {
+        case .live: "camera.viewfinder"
+        case .detections: "list.bullet.rectangle"
+        case .settings: "slider.horizontal.3"
+        }
+    }
+}
+
 struct CameraView: View {
     let radar: SoundRadar
     @State private var camera = CameraRadar()
+    @State private var subTab: CameraSubTab = .live
     @State private var lastBuzz = Date.distantPast
 
     private var warning: VehicleTrack? { camera.tracks.filter(\.warn).min { ($0.timeToReach ?? 99) < ($1.timeToReach ?? 99) } }
 
     var body: some View {
-        List {
-            Section {
-                CameraPreview(session: camera.session, tracks: camera.tracks, rotation: camera.rotation)
-                    .aspectRatio(3 / 4, contentMode: .fit)
-                    .listRowInsets(EdgeInsets())
-            } footer: {
-                Text("Hold or strap the phone upright or sideways (landscape sees more of the road to each side), back camera facing behind you. The motion sensor tells which way is up. Yellow = vehicle, red = warning.")
+        VStack(spacing: 0) {
+            Picker("Camera View", selection: $subTab) {
+                ForEach(CameraSubTab.allCases) { tab in
+                    Label(tab.rawValue, systemImage: tab.icon).tag(tab)
+                }
             }
-            if let p = camera.problem {
-                Section { Label(p, systemImage: "exclamationmark.triangle").foregroundStyle(.orange) }
+            .pickerStyle(.segmented)
+            .padding(.horizontal)
+            .padding(.vertical, 8)
+            .background(Color(.systemGroupedBackground))
+
+            switch subTab {
+            case .live:
+                liveTab
+            case .detections:
+                detectionsTab
+            case .settings:
+                settingsTab
             }
-            if let w = warning {
-                Section {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("⚠️ \(pretty(w.label)) behind you").font(.title2.bold()).foregroundStyle(.red)
-                        Text("Reaches you in \(String(format: "%.1f", w.timeToReach ?? 0)) s · \(sideText(w.lateral))").font(.title3)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Camera Radar")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                HStack(spacing: 12) {
+                    if camera.running {
+                        Button {
+                            camera.recording ? camera.stopRecording() : camera.startRecording()
+                        } label: {
+                            Image(systemName: camera.recording ? "record.circle.fill" : "record.circle")
+                                .foregroundStyle(camera.recording ? Color.red : Color.primary)
+                        }
+                        .accessibilityLabel(camera.recording ? "Stop recording" : "Record session")
+                    }
+                    Button {
+                        if camera.running {
+                            camera.stop()
+                        } else {
+                            Task { await camera.start() }
+                        }
+                    } label: {
+                        Image(systemName: camera.running ? "pause.circle.fill" : "play.circle.fill")
+                            .foregroundStyle(camera.running ? Color.secondary : Color.green)
+                    }
+                    .accessibilityLabel(camera.running ? "Pause camera" : "Start camera")
+                }
+            }
+        }
+        .task { await camera.start() }
+        .onDisappear { camera.stop() }
+        .onChange(of: warning?.id) {
+            guard warning != nil, Date.now.timeIntervalSince(lastBuzz) > 2 else { return }
+            lastBuzz = .now
+            let s = HapticSettings.load()
+            Task { _ = await radar.haptics.play(s.critical, title: "Watch out", body: "Vehicle behind you", via: s.method) }
+        }
+    }
+
+    // MARK: - Sub-Tab 1: Live Camera View
+
+    private var liveTab: some View {
+        ScrollView {
+            VStack(spacing: 12) {
+                if let p = camera.problem {
+                    Label(p, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 16))
+                }
+
+                if let w = warning {
+                    HStack(spacing: 12) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.largeTitle)
+                            .foregroundStyle(.white)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(pretty(w.label)) approaching!")
+                                .font(.headline.bold())
+                                .foregroundStyle(.white)
+                            Text("Reaches you in \(String(format: "%.1f", w.timeToReach ?? 0)) s · \(sideText(w.lateral))")
+                                .font(.subheadline)
+                                .foregroundStyle(.white.opacity(0.9))
+                        }
+                        Spacer()
+                        if let d = w.distance {
+                            Text(distanceText(d))
+                                .font(.title2.bold().monospacedDigit())
+                                .foregroundStyle(.white)
+                        }
+                    }
+                    .padding(14)
+                    .background(Color.red, in: .rect(cornerRadius: 18))
+                }
+
+                ZStack(alignment: .topLeading) {
+                    CameraPreview(session: camera.session, tracks: camera.tracks, rotation: camera.rotation)
+                        .aspectRatio(3 / 4, contentMode: .fit)
+                        .clipShape(.rect(cornerRadius: 20))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 20)
+                                .strokeBorder(warning != nil ? Color.red : Color.clear, lineWidth: 4)
+                        )
+
+                    // HUD Badges over camera preview
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 6) {
+                            Circle()
+                                .fill(camera.running ? Color.green : Color.secondary)
+                                .frame(width: 8, height: 8)
+                            Text(camera.running ? "\(camera.fps) fps · \(Int(camera.detectMs.rounded())) ms" : "Paused")
+                            Text("·")
+                            Text(camera.depth)
+                        }
+                        .font(.caption.monospacedDigit().bold())
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.6), in: .capsule)
+
+                        if camera.recording {
+                            HStack(spacing: 6) {
+                                Image(systemName: "record.circle.fill").foregroundStyle(.red)
+                                Text("REC \(Int(camera.recorded ?? 0))s")
+                            }
+                            .font(.caption.monospacedDigit().bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.black.opacity(0.6), in: .capsule)
+                        }
+                    }
+                    .padding(12)
+                }
+
+                // Quick filter chips for active objects
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(DetectableObject.allCases) { obj in
+                            let isOn = camera.settings.enabledObjects.contains(obj.rawValue)
+                            Button {
+                                toggleObject(obj.rawValue)
+                            } label: {
+                                Label(obj.title, systemImage: obj.icon)
+                                    .font(.caption.bold())
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(isOn ? Color.accentColor : Color(.secondarySystemGroupedBackground), in: .capsule)
+                                    .foregroundStyle(isOn ? Color.white : Color.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
+                // Live summary of tracked objects & distances
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Detected Objects (\(camera.tracks.count))")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(camera.method.rawValue)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if camera.tracks.isEmpty {
+                        Text(camera.running ? "No enabled objects in view" : camera.problem == nil ? "Camera paused" : "Camera unavailable")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 12)
+                    } else {
+                        ForEach(camera.tracks) { t in
+                            HStack(spacing: 12) {
+                                Image(systemName: DetectableObject(rawValue: t.label)?.icon ?? "car.fill")
+                                    .font(.title3)
+                                    .foregroundStyle(t.warn ? Color.red : Color.accentColor)
+                                    .frame(width: 28)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(pretty(t.label)) #\(t.id)")
+                                        .font(.subheadline.bold())
+                                        .foregroundStyle(t.warn ? Color.red : Color.primary)
+                                    Text("\(sideText(t.lateral)) · \(t.timeToReach.map { String(format: "reaches in %.1f s", $0) } ?? "steady/away")")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                VStack(alignment: .trailing, spacing: 2) {
+                                    Text(metres(t.distance))
+                                        .font(.title3.bold().monospacedDigit())
+                                        .foregroundStyle(t.warn ? Color.red : Color.primary)
+                                    Text(t.distanceFrom)
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            .padding(10)
+                            .background(Color(.tertiarySystemGroupedBackground), in: .rect(cornerRadius: 12))
+                        }
+                    }
+                }
+                .padding(14)
+                .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 18))
+
+                if camera.recording {
+                    HStack(spacing: 8) {
+                        ForEach([("Vehicle passed", "car.side"), ("Missed one", "eye.slash"), ("False alarm", "xmark.octagon")], id: \.0) { note, icon in
+                            Button { camera.mark(note) } label: {
+                                Label(note, systemImage: icon)
+                                    .font(.caption.bold())
+                                    .frame(maxWidth: .infinity, minHeight: 36)
+                            }
+                            .buttonStyle(.bordered)
+                        }
                     }
                 }
             }
+            .padding(.horizontal)
+            .padding(.bottom, 16)
+        }
+    }
+
+    // MARK: - Sub-Tab 2: Detections, Recording & Diagnostics
+
+    private var detectionsTab: some View {
+        List {
+            Section("Tracked Objects (\(camera.tracks.count))") {
+                if camera.tracks.isEmpty {
+                    Text(camera.running ? "None in view" : camera.problem == nil ? "Starting…" : "Camera not running")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(camera.tracks) { t in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(trackLine(t)).font(.subheadline.bold()).foregroundStyle(t.warn ? .red : .primary)
+                        Text("Closing \(t.closingSpeed.map { String(format: "%.1f m/s (%.0f km/h)", $0, $0 * 3.6) } ?? "–") · \(sideText(t.lateral)) · \(Int(t.confidence * 100))% sure")
+                            .font(.caption).foregroundStyle(.secondary)
+                        Text("Each way: LiDAR \(metres(t.lidarDistance)) · size \(metres(t.sizeDistance))\(t.learnedHeight.map { " (its height \(distanceText($0)))" } ?? "") · road \(metres(t.groundDistance)) · Depth Anything \(metres(t.modelDistance)) · width \(metres(t.widthDistance))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             Section {
                 Toggle(isOn: Binding(get: { camera.recording }, set: { $0 ? camera.startRecording() : camera.stopRecording() })) {
                     if camera.recording {
@@ -562,43 +826,13 @@ struct CameraView: View {
                         Label("Share last recording (video + tracks.csv + events.txt)", systemImage: "square.and.arrow.up")
                     }
                 }
-            } footer: {
-                Text("Saves the video with the boxes and numbers drawn in (≈ 60 MB per minute), tracks.csv (every vehicle in every frame: each distance method's number, reaches-you-in, speed, side, warning, timed to the video) and events.txt with your marks. Tap a mark the moment it happens; it's saved at that video time. Also in Files › On My iPhone › SpatialAudioDetect › Camera recordings.")
-            }
-            Section("Vehicles (\(camera.tracks.count))") {
-                if camera.tracks.isEmpty {
-                    Text(camera.running ? "None in view" : camera.problem == nil ? "Starting…" : "Camera not running").foregroundStyle(.secondary)
-                }
-                ForEach(camera.tracks) { t in
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(trackLine(t)).font(.subheadline.bold()).foregroundStyle(t.warn ? .red : .primary)
-                        Text("Closing \(t.closingSpeed.map { String(format: "%.1f m/s (%.0f km/h)", $0, $0 * 3.6) } ?? "–") · \(sideText(t.lateral)) · \(Int(t.confidence * 100))% sure")
-                            .font(.caption).foregroundStyle(.secondary)
-                        Text("Each way: LiDAR \(metres(t.lidarDistance)) · size \(metres(t.sizeDistance))\(t.learnedHeight.map { " (its height \(distanceText($0)))" } ?? "") · road \(metres(t.groundDistance)) · Depth Anything \(metres(t.modelDistance)) · width \(metres(t.widthDistance))")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                }
-            }
-            Section {
-                Picker("Detector", selection: $camera.detector) {
-                    ForEach(CameraDetector.allCases, id: \.self) { Text($0.rawValue) }
-                }
-                Picker("Distance", selection: $camera.method) {
-                    ForEach(DistanceMethod.allCases, id: \.self) { Text($0.rawValue) }
-                }
             } header: {
-                Text("Compare")
+                Text("Session Recording")
             } footer: {
-                Text("""
-                    Detector: YOLO26s at 960×736 sees farther vehicles; at 640 it's faster; YOLOv3 is the old model, for comparison. \
-                    Distance — Calculation: LiDAR within 5 m; beyond, the vehicle's height in the picture (its real height learned by \
-                    LiDAR if it came within 5 m, else typical: car 1.5 m, motorbike with rider 1.45 m) combined with where its wheels \
-                    meet the road (road fitted from LiDAR, used up to 15 m), smoothed over time. + Depth Anything: also the AI depth \
-                    model, calibrated by LiDAR each frame (costs frame rate). OpenCV method: the paper's formula, real width × focal \
-                    length ÷ width in pixels (car 1.8 m, motorbike 0.8 m). Every method's number is recorded each frame either way.
-                    """)
+                Text("Saves the video with the boxes and numbers drawn in (≈ 60 MB per minute), tracks.csv (every vehicle in every frame: each distance method's number, reaches-you-in, speed, side, warning, timed to the video) and events.txt with your marks. Also in Files › On My iPhone › SpatialAudioDetect › Camera recordings.")
             }
-            Section {
+
+            Section("System & Sensor Status") {
                 LabeledContent("Camera", value: camera.camera.isEmpty ? "–" : camera.camera)
                 LabeledContent("Phone held", value: camera.rotation.name)
                 LabeledContent("Depth", value: camera.depth)
@@ -606,32 +840,122 @@ struct CameraView: View {
                 LabeledContent("Depth Anything", value: camera.depthModel)
                 LabeledContent("Frames", value: "\(camera.fps)/s · model \(Int(camera.detectMs.rounded())) ms")
                 LabeledContent("Microphone (radar)", value: radar.micStatus)
-            } header: {
-                Text("Status")
-            } footer: {
-                Text("""
-                    Fewer false alarms: a vehicle must be found with ≥ \(Int(VehicleTracker.startConfidence * 100))% confidence to start \
-                    being followed and seen \(VehicleTracker.confirmHits) times before it shows or warns; weaker boxes only keep it followed. \
-                    People never raise a vehicle warning, a motorbike's rider merges into the motorbike, and anything LiDAR sees closer than \
-                    \(Int(VehicleTracker.lensBlocked * 100)) cm (a hand or strap on the lens) is ignored. \
-                    "Reaches you in": how fast its picture grows, which needs no distance at all. Side: where it is in the picture × \
-                    distance. Warning (red + vibration): reaches you within \(Int(VehicleTracker.warnSeconds)) s and passes within \
-                    \(Int(VehicleTracker.warnSide)) m of your path, or LiDAR sees it within 3 m and closing. Road: the ground behind you as \
-                    LiDAR sees it, which gives the camera's real height and tilt every frame. "Microphone": whether the sound radar keeps \
-                    listening while the camera runs. To judge distances, park a car or bike at measured distances (5, 10, 20, 30 m) and \
-                    compare the methods in tracks.csv.
-                    """)
             }
         }
-        .navigationTitle("Camera test")
-        .navigationBarTitleDisplayMode(.inline)
-        .task { await camera.start() }
-        .onDisappear { camera.stop() }
-        .onChange(of: warning?.id) {
-            guard warning != nil, Date.now.timeIntervalSince(lastBuzz) > 2 else { return }
-            lastBuzz = .now
-            let s = HapticSettings.load()
-            Task { _ = await radar.haptics.play(s.critical, title: "Watch out", body: "Vehicle behind you", via: s.method) }
+    }
+
+    // MARK: - Sub-Tab 3: Camera Settings
+
+    private var settingsTab: some View {
+        Form {
+            Section {
+                ForEach(DetectableObject.allCases) { obj in
+                    let isEnabled = camera.settings.enabledObjects.contains(obj.rawValue)
+                    Toggle(isOn: Binding(
+                        get: { isEnabled },
+                        set: { _ in toggleObject(obj.rawValue) }
+                    )) {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(obj.title)
+                                Text("Ref size: \(String(format: "%.2f", obj.typicalHeight)) m tall × \(String(format: "%.2f", obj.typicalWidth)) m wide")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } icon: {
+                            Image(systemName: obj.icon)
+                        }
+                    }
+                }
+                HStack {
+                    Button("Select All") {
+                        camera.settings.enabledObjects = Set(DetectableObject.allCases.map(\.rawValue))
+                    }
+                    Spacer()
+                    Button("Vehicles Only") {
+                        camera.settings.enabledObjects = ["car", "motorcycle", "bicycle", "bus", "truck"]
+                    }
+                }
+                .font(.subheadline)
+            } header: {
+                Text("Objects to Detect & Measure Distance")
+            } footer: {
+                Text("Choose which road objects the camera tracks and measures distance for. Unchecked objects are ignored on screen and in distance calculations.")
+            }
+
+            Section {
+                Picker("Distance Method", selection: $camera.method) {
+                    ForEach(DistanceMethod.allCases, id: \.self) { Text($0.rawValue) }
+                }
+                Picker("Vision Detector", selection: $camera.detector) {
+                    ForEach(CameraDetector.allCases, id: \.self) { Text($0.rawValue) }
+                }
+                Toggle("Merge rider into motorcycle / bicycle", isOn: $camera.settings.mergeRiderWithVehicle)
+            } header: {
+                Text("Distance Measurement & Model")
+            } footer: {
+                Text("""
+                    Detector: YOLO26s at 960×736 sees farther objects; at 640 it runs faster; YOLOv3 is the legacy model.
+                    Distance — Calculation: uses direct LiDAR depth within 5 m; beyond 5 m, combines the object's apparent height (calibrated by LiDAR when close, or reference height) with the LiDAR-fitted road plane up to 15 m, smoothed with a Kalman filter.
+                    + Depth Anything: adds the neural depth map calibrated against LiDAR each frame.
+                    OpenCV method: triangle similarity using reference object width.
+                    """)
+            }
+
+            Section {
+                ForEach(DetectableObject.allCases) { obj in
+                    let isEnabled = camera.settings.enabledObjects.contains(obj.rawValue)
+                    Toggle(isOn: Binding(
+                        get: { camera.settings.warnObjects.contains(obj.rawValue) },
+                        set: { on in
+                            if on {
+                                camera.settings.warnObjects.insert(obj.rawValue)
+                            } else {
+                                camera.settings.warnObjects.remove(obj.rawValue)
+                            }
+                        }
+                    )) {
+                        Label(obj.title, systemImage: obj.icon)
+                    }
+                    .disabled(!isEnabled)
+                }
+            } header: {
+                Text("Trigger Danger Warnings For")
+            } footer: {
+                Text("Objects enabled here will highlight in red and trigger haptic warnings when they approach on your path. By default, people do not trigger vehicle warnings unless enabled here.")
+            }
+
+            Section {
+                VStack(alignment: .leading, spacing: 4) {
+                    LabeledContent("Warn when reaching within", value: String(format: "%.1f s", camera.settings.warnSeconds))
+                    Slider(value: $camera.settings.warnSeconds, in: 1.0...6.0, step: 0.5)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    LabeledContent("Path clearance (side distance)", value: String(format: "%.1f m", camera.settings.warnSide))
+                    Slider(value: $camera.settings.warnSide, in: 0.5...4.0, step: 0.5)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    LabeledContent("Minimum detection confidence", value: "\(Int((camera.settings.startConfidence * 100).rounded()))%")
+                    Slider(value: $camera.settings.startConfidence, in: 0.25...0.85, step: 0.05)
+                }
+                Button("Reset Camera Settings to Defaults", role: .destructive) {
+                    camera.settings = CameraSettings()
+                    camera.detector = .yolo26Large
+                    camera.method = .calculation
+                }
+            } header: {
+                Text("Warning & Tracking Thresholds")
+            } footer: {
+                Text("Warnings fire when an enabled object is confirmed across \(VehicleTracker.confirmHits) frames and will reach you within the time threshold while passing within the side clearance, or when LiDAR sees it within 3 m closing at > 1 m/s.")
+            }
+        }
+    }
+
+    private func toggleObject(_ raw: String) {
+        if camera.settings.enabledObjects.contains(raw) {
+            camera.settings.enabledObjects.remove(raw)
+        } else {
+            camera.settings.enabledObjects.insert(raw)
         }
     }
 }
