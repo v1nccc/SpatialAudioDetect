@@ -4,12 +4,13 @@ import Foundation
 
 // Camera test recordings, in Documents/Camera recordings/<date time>/ (also in the Files app):
 //   video.mov    what the camera saw, boxes and numbers drawn in, upright
-//   tracks.csv   one row per vehicle per frame (a row with empty vehicle columns when none), timed to the video
+//   tracks.csv   one row per vehicle per frame (a row with empty vehicle columns when none), timed to the video;
+//                boxes normalized in the upright picture (top-left origin), however the phone was held
 //   events.txt   the tester's marks ("vehicle passed now", "missed", "false warning") at video time
 
-/// Draws each vehicle's box and a label ("Motorbike 12 m · 1.8 s") onto a BGRA frame in the camera sensor's own
-/// (landscape) orientation, the label upright and above the box once the video is turned upright (90° clockwise).
-nonisolated func drawOverlay(_ tracks: [VehicleTrack], on pixels: CVPixelBuffer) {
+/// Draws each vehicle's box and a label ("Motorbike 12.3 m · 1.8 s") onto a BGRA frame in the camera sensor's own
+/// (landscape) orientation, upright and above the box once the video is turned as `rotation` says.
+nonisolated func drawOverlay(_ tracks: [VehicleTrack], on pixels: CVPixelBuffer, rotation: PictureRotation) {
     CVPixelBufferLockBaseAddress(pixels, [])
     defer { CVPixelBufferUnlockBaseAddress(pixels, []) }
     guard CVPixelBufferGetPixelFormatType(pixels) == kCVPixelFormatType_32BGRA, let base = CVPixelBufferGetBaseAddress(pixels) else { return }
@@ -17,10 +18,15 @@ nonisolated func drawOverlay(_ tracks: [VehicleTrack], on pixels: CVPixelBuffer)
     guard let ctx = CGContext(data: base, width: Int(w), height: Int(h), bitsPerComponent: 8, bytesPerRow: CVPixelBufferGetBytesPerRow(pixels),
                               space: CGColorSpaceCreateDeviceRGB(),
                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return }
-    let font = CTFontCreateWithName("Helvetica-Bold" as CFString, h / 40, nil)
+    let font = CTFontCreateWithName("Helvetica-Bold" as CFString, min(w, h) / 40, nil)
+    // Draw in the upright picture (CG: y up), turned back onto the sensor's pixels.
+    let sideways = rotation.rawValue % 180 != 0, uw = sideways ? h : w, uh = sideways ? w : h
+    ctx.translateBy(x: rotation == .portrait || rotation == .landscapeTopRight ? w : 0,
+                    y: rotation == .landscapeTopRight || rotation == .upsideDown ? h : 0)
+    ctx.rotate(by: CGFloat(rotation.rawValue) * .pi / 180)
     for t in tracks {
         let color = t.warn ? CGColor(red: 1, green: 0.23, blue: 0.19, alpha: 1) : CGColor(red: 1, green: 0.84, blue: 0, alpha: 1)
-        let box = CGRect(x: t.rect.minX * w, y: (1 - t.rect.maxY) * h, width: t.rect.width * w, height: t.rect.height * h)  // CG: y up
+        let box = CGRect(x: t.rect.minX * uw, y: (1 - t.rect.maxY) * uh, width: t.rect.width * uw, height: t.rect.height * uh)
         guard t.confirmed else {  // not yet confirmed (maybe a false detection): thin grey, no label
             ctx.setStrokeColor(CGColor(gray: 0.75, alpha: 0.8))
             ctx.setLineWidth(2)
@@ -31,8 +37,8 @@ nonisolated func drawOverlay(_ tracks: [VehicleTrack], on pixels: CVPixelBuffer)
         ctx.setLineWidth(t.warn ? 8 : 4)
         ctx.stroke(box)
         var text = pretty(t.label)
-        if let d = t.distance { text += String(format: " %.0f m%@", d, t.fromLidar ? " LiDAR" : "") }
-        if let m = t.modelDistance { text += String(format: " (DA %.0f)", m) }
+        if let d = t.distance { text += " \(distanceText(d))\(t.fromLidar ? " LiDAR" : "")" }
+        if let m = t.modelDistance { text += " (DA \(distanceText(m)))" }
         if let s = t.timeToReach { text += String(format: " · %.1f s", s) }
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [
             NSAttributedString.Key(kCTFontAttributeName as String): font,
@@ -40,15 +46,11 @@ nonisolated func drawOverlay(_ tracks: [VehicleTrack], on pixels: CVPixelBuffer)
         ]))
         var ascent: CGFloat = 0, descent: CGFloat = 0
         let width = CGFloat(CTLineGetTypographicBounds(line, &ascent, &descent, nil))
-        // Upright, the sensor's "up" is the picture's right and its left the picture's top: write along +y, 90° turned.
-        ctx.saveGState()
-        ctx.translateBy(x: box.minX - descent - 4, y: box.minY)
-        ctx.rotate(by: .pi / 2)
+        let base = min(box.maxY + descent + 2, uh - ascent - 2)  // just above the box, or inside it at the top edge
         ctx.setFillColor(color)
-        ctx.fill(CGRect(x: 0, y: -descent - 2, width: width + 8, height: ascent + descent + 4))
-        ctx.textPosition = CGPoint(x: 4, y: 0)
+        ctx.fill(CGRect(x: box.minX, y: base - descent - 2, width: width + 8, height: ascent + descent + 4))
+        ctx.textPosition = CGPoint(x: box.minX + 4, y: base)
         CTLineDraw(line, ctx)
-        ctx.restoreGState()
     }
 }
 
@@ -69,9 +71,9 @@ nonisolated final class CameraRecorder {
                           "box_w", "box_h", "distance_m", "distance_from", "lidar_m", "size_estimate_m", "reaches_you_s",
                           "closing_mps", "side_m_left_plus", "warning", "depth_model_m", "depth_fit_points", "depth_fit_r2",
                           "detector", "distance_method", "confirmed", "distance_by", "road_m", "width_m", "learned_height_m",
-                          "road_height_m", "road_tilt_deg"]
+                          "road_height_m", "road_tilt_deg", "phone"]
 
-    init(folder: URL, width: Int, height: Int) throws {
+    init(folder: URL, width: Int, height: Int, rotation: PictureRotation) throws {
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         writer = try AVAssetWriter(outputURL: folder.appending(path: "video.mov"), fileType: .mov)
         input = AVAssetWriterInput(mediaType: .video, outputSettings: [
@@ -79,7 +81,7 @@ nonisolated final class CameraRecorder {
             AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 8_000_000],
         ])
         input.expectsMediaDataInRealTime = true
-        input.transform = CGAffineTransform(rotationAngle: .pi / 2)  // play upright, like the preview
+        input.transform = CGAffineTransform(rotationAngle: CGFloat(rotation.rawValue) * .pi / 180)  // play upright, as held at the start
         writer.add(input)
         func open(_ name: String, _ header: String) throws -> FileHandle {
             let url = folder.appending(path: name)
@@ -97,7 +99,7 @@ nonisolated final class CameraRecorder {
 
     /// The frame (already drawn on) and what was found in it. Camera queue.
     func add(_ sample: CMSampleBuffer, tracks: [VehicleTrack], modelMs: Double, depth: Bool, fit: DepthFit?, detector: String,
-             method: String, road: GroundPlane?) {
+             method: String, road: GroundPlane?, phone: String) {
         let pts = CMSampleBufferGetPresentationTimeStamp(sample)
         if start == nil {
             guard writer.startWriting() else { return }
@@ -110,7 +112,7 @@ nonisolated final class CameraRecorder {
         func f(_ x: Double?, _ digits: Int = 2) -> String { x.map { String(format: "%.\(digits)f", $0) } ?? "" }
         let head = [f(seconds, 3), "\(frame)", f(modelMs, 1), depth ? "yes" : "no"]
         let frameTail = [fit.map { "\($0.points)" } ?? "", f(fit?.r2, 3), "\"\(detector)\"", "\"\(method)\""]
-        let roadTail = [f(road?.height), f(road?.tilt, 1)]
+        let roadTail = [f(road?.height), f(road?.tilt, 1), "\"\(phone)\""]
         let empty = Array(repeating: "", count: 14)  // the vehicle columns before depth_model_m
         let rows = tracks.isEmpty ? [head + empty + [""] + frameTail + ["", "", "", "", ""] + roadTail] : tracks.map { t in
             head + ["\(t.id)", t.label, f(t.confidence), f(Double(t.rect.minX), 4), f(Double(t.rect.minY), 4), f(Double(t.rect.width), 4),

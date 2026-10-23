@@ -7,13 +7,12 @@ import Foundation
 // far beyond LiDAR's range. How well that holds at 20–40 m is what this trial measures.
 
 /// The part of the upright camera picture the depth model sees: the full width and the middle band at the model's
-/// landscape shape (518×392), so nothing is stretched. Upright, the sensor's x runs down the picture and its y from
-/// right to left (as in VehicleTracker).
+/// landscape shape (518×392), so nothing is stretched (held sideways, the picture is that shape already).
 nonisolated struct DepthCrop: Sendable {
     let band: Double     // fraction of the picture's height inside the crop
     let top: Double      // where it starts, from the top
 
-    /// `uprightAspect`: the upright picture's width ÷ height (0.75 for 1440×1920). `modelAspect`: 518 ÷ 392.
+    /// `uprightAspect`: the upright picture's width ÷ height (0.75 for 1440×1920 portrait). `modelAspect`: 518 ÷ 392.
     init(uprightAspect: Double, modelAspect: Double) {
         band = min(uprightAspect / modelAspect, 1)
         top = (1 - band) / 2
@@ -22,10 +21,11 @@ nonisolated struct DepthCrop: Sendable {
     /// Vision's region of interest for this crop (normalized, bottom-left origin; symmetric, so the same either way).
     var region: CGRect { CGRect(x: 0, y: top, width: 1, height: band) }
 
-    /// A sensor-normalized point (top-left origin) in the depth map (0…1 across, 0…1 down), nil outside the crop.
-    func modelPoint(sensorX: Double, sensorY: Double) -> (x: Double, y: Double)? {
-        let across = 1 - sensorY, down = (sensorX - top) / band
-        return down >= 0 && down <= 1 ? (across, down) : nil
+    /// A point of the upright picture (normalized, top-left origin) in the depth map (0…1 across, 0…1 down), nil
+    /// outside the crop.
+    func modelPoint(x: Double, y: Double) -> (x: Double, y: Double)? {
+        let down = (y - top) / band
+        return down >= 0 && down <= 1 ? (x, down) : nil
     }
 }
 
@@ -62,11 +62,13 @@ nonisolated func depthModelSelfCheck() {
     // Upright 1440×1920 picture into a 518×392 model: the middle 57% of the height.
     let crop = DepthCrop(uprightAspect: 1440.0 / 1920, modelAspect: 518.0 / 392)
     precondition(abs(crop.band - 0.5676) < 0.001 && abs(crop.top - 0.2162) < 0.001, "crop -> \(crop)")
-    let centre = crop.modelPoint(sensorX: 0.5, sensorY: 0.5)!
+    let centre = crop.modelPoint(x: 0.5, y: 0.5)!
     precondition(abs(centre.x - 0.5) < 1e-9 && abs(centre.y - 0.5) < 1e-9, "picture centre = model centre")
-    let right = crop.modelPoint(sensorX: 0.5, sensorY: 0.1)!  // sensor y near 0 = the upright picture's right edge
-    precondition(right.x > 0.85, "sensor y ≈ 0 is the right of the picture -> \(right)")
-    precondition(crop.modelPoint(sensorX: 0.05, sensorY: 0.5) == nil, "the top of the picture is outside the band")
+    let low = crop.modelPoint(x: 0.9, y: 0.7)!
+    precondition(abs(low.x - 0.9) < 1e-9 && abs(low.y - (0.7 - 0.2162) / 0.5676) < 0.001, "lower right -> \(low)")
+    precondition(crop.modelPoint(x: 0.5, y: 0.05) == nil, "the top of the picture is outside the band")
+    let sideways = DepthCrop(uprightAspect: 1920.0 / 1440, modelAspect: 518.0 / 392)
+    precondition(sideways.band == 1 && sideways.top == 0, "landscape: the whole picture -> \(sideways)")
 
     // A model whose values are 3/z + 0.2 (plus a few bad reflections): recovered from LiDAR at 0.5–5 m, then 30 m read back.
     var pairs = stride(from: 0.5, through: 5.0, by: 0.05).map { (value: 3 / $0 + 0.2, metres: $0) }

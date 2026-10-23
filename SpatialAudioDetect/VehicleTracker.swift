@@ -5,10 +5,10 @@ import simd
 // Camera test: vehicles found by the vision model, followed frame to frame, and what that says about each one —
 // distance, seconds until it reaches you, closing speed, how far to your side it will pass. Pure, so the Mac can check it.
 //
-// Geometry assumes the phone is upright (portrait) with its back camera facing backward, e.g. strapped to your back.
-// Rects are normalized in the camera sensor's own landscape image, top-left origin: the same space as the LiDAR depth
-// map and AVCaptureVideoPreviewLayer's metadata rects. Upright, the sensor's x runs down the picture and its y from
-// right to left.
+// The phone may be held upright or sideways, its back camera facing backward (e.g. strapped to your back). Rects and
+// intrinsics here are in the upright picture (normalized, top-left origin, x right, y down), whichever way the phone is
+// held; PictureRotation turns them to and from the camera sensor's own landscape image (the LiDAR depth map's and
+// AVCaptureVideoPreviewLayer's metadata space).
 
 /// One object the model found in one frame. `confidence`: the box's own score (Vision's observation confidence, not the
 /// label's, which is ~1.0 for every box). `lidar`: LiDAR distance inside its box (m).
@@ -20,9 +20,58 @@ nonisolated struct VehicleDetection: Sendable {
     var modelDepth: Double? = nil  // Depth Anything V2's distance (m), when it ran this frame
 }
 
-/// The camera's focal lengths and centre, as fractions of the sensor image's width (x) and height (y).
+/// The camera's focal lengths and centre, as fractions of the image's width (x) and height (y): of the sensor's own
+/// image, or the upright picture, whichever it's used for. Defaults: the 1× camera's sensor image.
 nonisolated struct CameraIntrinsics: Sendable {
     var fx = 0.71, fy = 0.95, cx = 0.5, cy = 0.5
+}
+
+/// How far the camera sensor's own landscape image turns clockwise to stand upright, in degrees, which depends on how
+/// the phone is held.
+nonisolated enum PictureRotation: Int, Sendable {
+    case landscapeTopLeft = 0, portrait = 90, landscapeTopRight = 180, upsideDown = 270
+
+    var name: String {
+        [.landscapeTopLeft: "Landscape (top to the left)", .portrait: "Portrait", .landscapeTopRight: "Landscape (top to the right)",
+         .upsideDown: "Upside down"][self]!
+    }
+
+    /// From gravity in the phone's axes (Core Motion: x toward its right edge, y toward its top). Stays `current` until
+    /// the phone is clearly (≥ ~50°) in another pose, so running bounce or a phone lying flat doesn't flip it.
+    static func from(gravityX x: Double, y: Double, current: PictureRotation) -> PictureRotation {
+        guard max(abs(x), abs(y)) >= 0.75 else { return current }
+        return abs(x) > abs(y) ? (x < 0 ? .landscapeTopLeft : .landscapeTopRight) : (y < 0 ? .portrait : .upsideDown)
+    }
+
+    /// A normalized point in the sensor's image → the same point in the upright picture.
+    func upright(x: Double, y: Double) -> (x: Double, y: Double) {
+        switch self {
+        case .landscapeTopLeft: (x, y)
+        case .portrait: (1 - y, x)
+        case .landscapeTopRight: (1 - x, 1 - y)
+        case .upsideDown: (y, 1 - x)
+        }
+    }
+
+    func upright(_ r: CGRect) -> CGRect {
+        let a = upright(x: r.minX, y: r.minY), b = upright(x: r.maxX, y: r.maxY)
+        return CGRect(x: min(a.x, b.x), y: min(a.y, b.y), width: abs(b.x - a.x), height: abs(b.y - a.y))
+    }
+
+    /// Upright picture → sensor image: turning the rest of the way round.
+    func sensor(_ r: CGRect) -> CGRect { PictureRotation(rawValue: (360 - rawValue) % 360)!.upright(r) }
+
+    /// The sensor's intrinsics, for the upright picture.
+    func upright(_ c: CameraIntrinsics) -> CameraIntrinsics {
+        let centre = upright(x: c.cx, y: c.cy), sideways = rawValue % 180 != 0
+        return CameraIntrinsics(fx: sideways ? c.fy : c.fx, fy: sideways ? c.fx : c.fy, cx: centre.x, cy: centre.y)
+    }
+}
+
+/// "85 cm" below a metre, "12.3 m" from there.
+nonisolated func distanceText(_ m: Double) -> String {
+    let cm = Int((m * 100).rounded())
+    return cm < 100 ? "\(cm) cm" : String(format: "%.1f m", m)
 }
 
 /// How a vehicle's distance is worked out; all are computed and recorded every frame, this one is shown and used.
@@ -39,9 +88,9 @@ nonisolated let vehicleWidths: [String: Double] = ["car": 1.8, "motorcycle": 0.8
 /// The same thing under the label each model uses (Apple's YOLOv3 says "motorbike", YOLO26 "motorcycle").
 nonisolated func normalizedLabel(_ label: String) -> String { label == "motorbike" ? "motorcycle" : label }
 
-/// Vision's box for an upright (`.right`) back-camera frame (normalized, bottom-left origin) in sensor coordinates.
-nonisolated func sensorRect(fromVision r: CGRect) -> CGRect {
-    CGRect(x: 1 - r.maxY, y: 1 - r.maxX, width: r.height, height: r.width)
+/// Vision's box (normalized, bottom-left origin, in the picture it was given upright) with a top-left origin.
+nonisolated func uprightRect(fromVision r: CGRect) -> CGRect {
+    CGRect(x: r.minX, y: 1 - r.maxY, width: r.width, height: r.height)
 }
 
 /// Least-squares slope of y over x; nil without spread.
@@ -167,20 +216,18 @@ nonisolated struct VehicleTracker {
         k.hits += 1
         k.confirmed = k.confirmed || k.hits >= Self.confirmHits
 
-        // Upright, its height in the picture is the sensor rect's width, its width the rect's height, and its
-        // left–right position the rect's y; the road contact point is the box's bottom = the rect's maxX.
-        let size = Double(d.rect.width)
+        let size = Double(d.rect.height)  // its height in the picture
         let lidar = d.lidar.flatMap { $0 <= Self.lidarRange ? $0 : nil }
         if let lidar {  // learn this vehicle's real height while LiDAR can measure it
-            let h = lidar * size / camera.fx
+            let h = lidar * size / camera.fy
             if (0.5...4.5).contains(h) { k.heights = Array((k.heights + [h]).suffix(15)) }
         }
         k.learnedHeight = k.heights.count >= 3 ? k.heights.sorted()[k.heights.count / 2] : nil
         k.lidarDistance = d.lidar
         k.modelDistance = d.modelDepth
-        k.sizeDistance = camera.fx * (k.learnedHeight ?? vehicleHeights[k.label]!) / max(size, 1e-4)
-        k.widthDistance = camera.fy * vehicleWidths[k.label]! / max(Double(d.rect.height), 1e-4)
-        k.groundDistance = road?.distance(sensorX: Double(d.rect.maxX), sensorY: Double(d.rect.midY), camera: camera)
+        k.sizeDistance = camera.fy * (k.learnedHeight ?? vehicleHeights[k.label]!) / max(size, 1e-4)
+        k.widthDistance = camera.fx * vehicleWidths[k.label]! / max(Double(d.rect.width), 1e-4)
+        k.groundDistance = road?.distance(x: Double(d.rect.midX), y: Double(d.rect.maxY), camera: camera)  // where its wheels are
         k.fromLidar = lidar != nil
 
         // This frame's measurement by the chosen method, with how uncertain it is (as a fraction of the distance).
@@ -209,8 +256,8 @@ nonisolated struct VehicleTracker {
         k.distance = max(k.filter.d, 0.3)
         k.distanceFrom = from
         k.closingSpeed = k.filter.updates >= 5 ? -k.filter.v : nil
-        // Looking backward, the camera's right is your left.
-        k.lateral = (camera.cy - Double(d.rect.midY)) / camera.fy * k.distance!
+        // Looking backward, the picture's right is your left.
+        k.lateral = (Double(d.rect.midX) - camera.cx) / camera.fx * k.distance!
 
         // Picture size ∝ 1 / distance, so d(ln size)/dt = closing speed ÷ distance = 1 / seconds until it reaches you.
         k.samples.append(.init(t: t, size: size))
@@ -229,33 +276,63 @@ nonisolated struct VehicleTracker {
 }
 
 nonisolated func vehicleTrackerSelfCheck() {
-    // Vision box (bottom-left origin, upright picture) -> sensor rect.
-    let r = sensorRect(fromVision: CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4))
-    precondition(abs(r.minX - 0.4) < 1e-9 && abs(r.minY - 0.6) < 1e-9 && abs(r.width - 0.4) < 1e-9 && abs(r.height - 0.3) < 1e-9, "rect -> \(r)")
+    // Vision box (bottom-left origin) -> top-left origin; in portrait, the same sensor rect as before landscape support.
+    let r = uprightRect(fromVision: CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4))
+    precondition(abs(r.minX - 0.1) + abs(r.minY - 0.4) + abs(r.width - 0.3) + abs(r.height - 0.4) < 1e-9, "rect -> \(r)")
+    let s = PictureRotation.portrait.sensor(r)
+    precondition(abs(s.minX - 0.4) < 1e-9 && abs(s.minY - 0.6) < 1e-9 && abs(s.width - 0.4) < 1e-9 && abs(s.height - 0.3) < 1e-9, "sensor rect -> \(s)")
 
-    // A motorbike at 30 km/h coming up behind you, 1 m to your left, seen at 30 fps with ±3% box jitter.
-    let camera = CameraIntrinsics(fx: 0.71, fy: 0.95)  // 1× camera: focal ÷ sensor width / height
-    var tracker = VehicleTracker(), wobble: UInt64 = 1, warnedAt: Double?
+    // Every pose: sensor <-> upright round trip, and the turned intrinsics put a 3D point where turning its picture does.
+    let lens = CameraIntrinsics(fx: 0.71, fy: 0.95, cx: 0.49, cy: 0.52)  // 1× camera, sensor image
+    for pose in [PictureRotation.landscapeTopLeft, .portrait, .landscapeTopRight, .upsideDown] {
+        let box = CGRect(x: 0.1, y: 0.2, width: 0.3, height: 0.4), back = pose.sensor(pose.upright(box))
+        precondition(abs(back.minX - box.minX) + abs(back.minY - box.minY) + abs(back.width - box.width) + abs(back.height - box.height) < 1e-9,
+                     "\(pose) round trip -> \(back)")
+        let p = (x: 0.7, y: -0.4, z: 5.0)  // a point in the sensor's camera axes, m
+        let seen = pose.upright(x: lens.cx + lens.fx * p.x / p.z, y: lens.cy + lens.fy * p.y / p.z)
+        let q = [(p.x, p.y), (-p.y, p.x), (-p.x, -p.y), (p.y, -p.x)][pose.rawValue / 90]  // the same point, upright axes
+        let c = pose.upright(lens)
+        precondition(abs(seen.x - (c.cx + c.fx * q.0 / p.z)) < 1e-9 && abs(seen.y - (c.cy + c.fy * q.1 / p.z)) < 1e-9, "\(pose) intrinsics")
+    }
+    precondition(PictureRotation.from(gravityX: 0.05, y: -0.99, current: .landscapeTopLeft) == .portrait, "upright")
+    precondition(PictureRotation.from(gravityX: -0.97, y: 0.1, current: .portrait) == .landscapeTopLeft, "top to the left")
+    precondition(PictureRotation.from(gravityX: 0.9, y: -0.3, current: .portrait) == .landscapeTopRight, "top to the right")
+    precondition(PictureRotation.from(gravityX: -0.6, y: -0.6, current: .portrait) == .portrait, "halfway: keeps the pose")
+    precondition(PictureRotation.from(gravityX: 0.1, y: 0.1, current: .landscapeTopLeft) == .landscapeTopLeft, "lying flat: keeps the pose")
+    precondition(distanceText(0.85) == "85 cm" && distanceText(0.996) == "1.0 m" && distanceText(12.34) == "12.3 m", "units")
+
+    // A motorbike at 30 km/h coming up behind you, 1 m to your left, seen at 30 fps with ±3% box jitter; held either way.
+    var wobble: UInt64 = 1
     func jitter() -> Double { wobble = wobble &* 6364136223846793005 &+ 1442695040888963407; return 1 + 0.06 * (Double(wobble >> 11) / Double(1 << 53) - 0.5) }
+    for pose in [PictureRotation.portrait, .landscapeTopLeft] {
+        let camera = pose.upright(lens)
+        func box(distance d: Double, left: Double, height: Double) -> CGRect {
+            let size = camera.fy * height / d * jitter(), mid = camera.cx + left / d * camera.fx
+            return CGRect(x: mid - size * 0.3, y: 0.5 - size / 2, width: size * 0.6, height: size)
+        }
+        var tracker = VehicleTracker(), warnedAt: Double?, atTwo: VehicleTrack?
+        for k in 0..<117 {  // 40 m to 7.5 m (3.9 s)
+            let t = Double(k) / 30, d = 40 - 8.33 * t
+            let found = tracker.update([VehicleDetection(label: "motorbike", confidence: 0.8, rect: box(distance: d, left: 1, height: 1.45))],
+                                       at: t, camera: camera)
+            if warnedAt == nil, found.first?.warn == true { warnedAt = d / 8.33 }
+            if atTwo == nil, d <= 16.7 { atTwo = found.first }
+        }
+        let bike = atTwo!
+        precondition(bike.id == 1 && tracker.tracks.count == 1 && bike.label == "motorcycle", "\(pose): one bike, one track, one label")
+        precondition(abs(bike.timeToReach! - 2) < 0.4, "\(pose): reaches you in ~2 s -> \(bike.timeToReach!)")
+        precondition(abs(bike.distance! - 16.7) < 2.5, "\(pose): ~16.7 m away -> \(bike.distance!)")
+        precondition(abs(bike.closingSpeed! - 8.33) < 2, "\(pose): closing at ~8.3 m/s -> \(bike.closingSpeed!)")
+        precondition(abs(bike.lateral! - 1) < 0.3, "\(pose): 1 m to your left -> \(bike.lateral!)")
+        precondition(abs((warnedAt ?? 0) - 3) < 0.5, "\(pose): warned ~3 s before it reaches you -> \(warnedAt.map { "\($0) s" } ?? "never")")
+    }
+
+    // The rest in portrait.
+    let camera = PictureRotation.portrait.upright(lens)
     func box(distance d: Double, left: Double, height: Double) -> CGRect {
-        let size = camera.fx * height / d * jitter(), mid = 0.5 - left / d * camera.fy
-        return CGRect(x: 0.5 - size / 2, y: mid - size * 0.3, width: size, height: size * 0.6)
+        let size = camera.fy * height / d * jitter(), mid = camera.cx + left / d * camera.fx
+        return CGRect(x: mid - size * 0.3, y: 0.5 - size / 2, width: size * 0.6, height: size)
     }
-    var atTwo: VehicleTrack?
-    for k in 0..<117 {  // 40 m to 7.5 m (3.9 s)
-        let t = Double(k) / 30, d = 40 - 8.33 * t
-        let found = tracker.update([VehicleDetection(label: "motorbike", confidence: 0.8, rect: box(distance: d, left: 1, height: 1.45))],
-                                   at: t, camera: camera)
-        if warnedAt == nil, found.first?.warn == true { warnedAt = d / 8.33 }
-        if atTwo == nil, d <= 16.7 { atTwo = found.first }
-    }
-    let bike = atTwo!
-    precondition(bike.id == 1 && tracker.tracks.count == 1 && bike.label == "motorcycle", "one bike, one track, one label")
-    precondition(abs(bike.timeToReach! - 2) < 0.4, "reaches you in ~2 s -> \(bike.timeToReach!)")
-    precondition(abs(bike.distance! - 16.7) < 2.5, "~16.7 m away -> \(bike.distance!)")
-    precondition(abs(bike.closingSpeed! - 8.33) < 2, "closing at ~8.3 m/s -> \(bike.closingSpeed!)")
-    precondition(abs(bike.lateral! - 1) < 0.3, "1 m to your left -> \(bike.lateral!)")
-    precondition(abs((warnedAt ?? 0) - 3) < 0.5, "warned ~3 s before it reaches you -> \(warnedAt.map { "\($0) s" } ?? "never")")
 
     // A car on the road 4 m to your side: coming closer, but passing clear of you. A parked car: never.
     var road = VehicleTracker(), parked = VehicleTracker(), roadWarned = false, parkedWarned = false
@@ -305,7 +382,7 @@ nonisolated func vehicleTrackerSelfCheck() {
     var van = VehicleTracker(), vanAt20: VehicleTrack?
     for k in 0..<240 {
         let t = Double(k) / 30, d = 3 + 2.5 * t  // driving away from 3 m to 23 m
-        let rect = CGRect(x: 0.5 - camera.fx * 1.9 / d / 2, y: 0.4, width: camera.fx * 1.9 / d, height: camera.fy * 1.8 / d)
+        let rect = CGRect(x: 0.4, y: 0.5 - camera.fy * 1.9 / d / 2, width: camera.fx * 1.8 / d, height: camera.fy * 1.9 / d)
         vanAt20 = van.update([VehicleDetection(label: "car", confidence: 0.9, rect: rect, lidar: d <= 5 ? d : nil)], at: t, camera: camera).first
         if d >= 20 { break }
     }

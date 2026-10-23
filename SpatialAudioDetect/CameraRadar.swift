@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreML
+import CoreMotion
 import SwiftUI
 import UIKit
 @preconcurrency import Vision
@@ -11,7 +12,15 @@ nonisolated struct CameraFrame: Sendable {
     var depth: String  // "LiDAR 320×240", "no depth this frame"
     var recorded: Double?  // seconds recorded so far, while recording
     var depthModel: String  // Depth Anything V2 status: "fit 812 LiDAR pts · R² 0.94 · 27 ms", "off", …
-    var road: String        // "1.12 m below the camera, looking 8° down (534 LiDAR pts)", "no road in LiDAR range"
+    var road: String        // "1.1 m below the camera, looking 8° down (534 LiDAR pts)", "no road in LiDAR range"
+    var rotation: PictureRotation
+}
+
+extension PictureRotation {
+    /// How Vision is told to turn the camera image upright.
+    nonisolated var vision: CGImagePropertyOrientation {
+        [.landscapeTopLeft: .up, .portrait: .right, .landscapeTopRight: .down, .upsideDown: .left][self]!
+    }
 }
 
 /// Which vision model finds the vehicles (switchable in the camera test to compare).
@@ -57,8 +66,10 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
     let videoOutput = AVCaptureVideoDataOutput()
     let depthOutput = AVCaptureDepthDataOutput()
     var onFrame: (@Sendable (CameraFrame) -> Void)?
-    var camera = CameraIntrinsics()   // from the lens until LiDAR calibration data arrives
+    var lens = CameraIntrinsics()     // in the sensor's own image; from the lens until LiDAR calibration data arrives
     var method = DistanceMethod.calculation  // camera queue, like everything below
+    private var rotation = PictureRotation.portrait  // how the phone is held, from gravity
+    private let motion = CMMotionManager()
     private(set) var detector = CameraDetector.yolo26Large
     private var requests: [CameraDetector: VNCoreMLRequest] = [:]
     private let depthRequest: VNCoreMLRequest?
@@ -87,7 +98,12 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
     init(depthModel: MLModel?) {
         depthRequest = depthModel.flatMap { try? VNCoreMLRequest(model: VNCoreMLModel(for: $0)) }
         depthRequest?.imageCropAndScaleOption = .scaleFill  // with the region below: an undistorted middle band
+        super.init()
+        motion.deviceMotionUpdateInterval = 0.1
+        motion.startDeviceMotionUpdates()  // read each frame; gravity says portrait or landscape, even with rotation lock on
     }
+
+    deinit { motion.stopDeviceMotionUpdates() }
 
     /// Switch vision model (loaded the first time it's picked). False if it's missing from the app. Camera queue.
     @discardableResult
@@ -121,21 +137,27 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
     private func process(_ sample: CMSampleBuffer, _ pixels: CVPixelBuffer, at t: Double, depth: AVDepthData?) {
         if let cal = depth?.cameraCalibrationData {
             let m = cal.intrinsicMatrix, ref = cal.intrinsicMatrixReferenceDimensions
-            camera = CameraIntrinsics(fx: Double(m.columns.0.x) / Double(ref.width), fy: Double(m.columns.1.y) / Double(ref.height),
-                                      cx: Double(m.columns.2.x) / Double(ref.width), cy: Double(m.columns.2.y) / Double(ref.height))
+            lens = CameraIntrinsics(fx: Double(m.columns.0.x) / Double(ref.width), fy: Double(m.columns.1.y) / Double(ref.height),
+                                    cx: Double(m.columns.2.x) / Double(ref.width), cy: Double(m.columns.2.y) / Double(ref.height))
         }
+        // Everything below works in the upright picture, portrait or landscape.
+        if let g = motion.deviceMotion?.gravity {
+            let r = PictureRotation.from(gravityX: g.x, y: g.y, current: rotation)
+            if r != rotation { (rotation, road) = (r, nil); tracker = VehicleTracker() }  // old boxes and road don't line up any more
+        }
+        let camera = rotation.upright(lens)
         // The road from LiDAR, every other frame; kept half a second if it can't be seen for a moment.
-        if frameCount % 2 == 0, let map = depth?.depthDataMap, let plane = fitGroundPlane(roadPoints(map)) { road = (plane, t) }
+        if frameCount % 2 == 0, let map = depth?.depthDataMap, let plane = fitGroundPlane(roadPoints(map, camera: camera)) { road = (plane, t) }
         if let r = road, t - r.at > 0.5 { road = nil }
         // Depth Anything V2 on every 3rd frame (~10 per second), calibrated against this frame's LiDAR.
-        let crop = DepthCrop(uprightAspect: Double(CVPixelBufferGetHeight(pixels)) / Double(CVPixelBufferGetWidth(pixels)),
-                             modelAspect: 518.0 / 392)
+        let pw = Double(CVPixelBufferGetWidth(pixels)), ph = Double(CVPixelBufferGetHeight(pixels))
+        let crop = DepthCrop(uprightAspect: rotation.rawValue % 180 == 0 ? pw / ph : ph / pw, modelAspect: 518.0 / 392)
         frameCount += 1
         let useDepthModel = method == .calculationDepth
         if useDepthModel, let depthRequest, frameCount % 3 == 0 {
             let started = CACurrentMediaTime()
             depthRequest.regionOfInterest = crop.region
-            try? VNImageRequestHandler(cvPixelBuffer: pixels, orientation: .right).perform([depthRequest])
+            try? VNImageRequestHandler(cvPixelBuffer: pixels, orientation: rotation.vision).perform([depthRequest])
             depthMs = (CACurrentMediaTime() - started) * 1000
             depthMap = (depthRequest.results?.first as? VNPixelBufferObservation)?.pixelBuffer
             depthFit = nil
@@ -147,38 +169,41 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         let start = CACurrentMediaTime()
         var found: [VehicleDetection] = []
         if let request = requests[detector] {
-            // Upright phone, back camera: the model sees the picture the right way up.
-            try? VNImageRequestHandler(cvPixelBuffer: pixels, orientation: .right).perform([request])
+            // The model sees the picture the right way up, however the phone is held.
+            try? VNImageRequestHandler(cvPixelBuffer: pixels, orientation: rotation.vision).perform([request])
             for o in (request.results as? [VNRecognizedObjectObservation]) ?? [] {
                 // The box's own score: the label's confidence is only "which class", ~1.0 for every box.
                 guard let top = o.labels.first, Double(o.confidence) >= VehicleTracker.keepConfidence else { continue }
-                let rect = sensorRect(fromVision: o.boundingBox)
+                let rect = uprightRect(fromVision: o.boundingBox)
                 found.append(VehicleDetection(label: top.identifier, confidence: Double(o.confidence), rect: rect,
-                                              lidar: depth.flatMap { medianDepth(in: rect, of: $0.depthDataMap) },
+                                              lidar: depth.flatMap { medianDepth(in: rotation.sensor(rect), of: $0.depthDataMap) },
                                               modelDepth: modelDistance(of: rect, crop: crop)))
             }
         }
         let ms = (CACurrentMediaTime() - start) * 1000
         let tracks = tracker.update(found, at: t, camera: camera, road: road?.plane, method: method)
         if let folder = recordTo, recorder == nil {
-            recorder = try? CameraRecorder(folder: folder, width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels))
+            recorder = try? CameraRecorder(folder: folder, width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels),
+                                           rotation: rotation)
             if recorder == nil { recordTo = nil }
         }
         if let recorder {
-            drawOverlay(tracks, on: pixels)  // after the model has seen the frame
+            drawOverlay(tracks, on: pixels, rotation: rotation)  // after the model has seen the frame
             recorder.add(sample, tracks: tracks, modelMs: ms, depth: depth != nil, fit: depthFit, detector: detector.rawValue,
-                         method: method.rawValue, road: road?.plane)
+                         method: method.rawValue, road: road?.plane, phone: rotation.name)
         }
         let map = depth?.depthDataMap
         onFrame?(CameraFrame(tracks: tracks, detectMs: ms,
                              depth: map.map { "LiDAR \(CVPixelBufferGetWidth($0))×\(CVPixelBufferGetHeight($0))" } ?? "no depth this frame",
                              recorded: recorder?.seconds, depthModel: depthStatus,
-                             road: road.map { String(format: "%.2f m below the camera, looking %.0f° down (%d LiDAR pts)", $0.plane.height, $0.plane.tilt, $0.plane.points) }
-                                 ?? "no road in LiDAR range (needs ground 0.5–5 m behind you)"))
+                             road: road.map { String(format: "%@ below the camera, looking %.0f° down (%d LiDAR pts)", distanceText($0.plane.height), $0.plane.tilt, $0.plane.points) }
+                                 ?? "no road in LiDAR range (needs ground 0.5–5 m behind you)",
+                             rotation: rotation))
     }
 
-    /// LiDAR points (camera coordinates, m) in the lower part of the upright picture, where the road behind you is.
-    private func roadPoints(_ map: CVPixelBuffer) -> [SIMD3<Double>] {
+    /// LiDAR points (upright camera axes: x right, y down, z out of the lens; m) in the lower part of the upright
+    /// picture, where the road behind you is.
+    private func roadPoints(_ map: CVPixelBuffer, camera: CameraIntrinsics) -> [SIMD3<Double>] {
         CVPixelBufferLockBaseAddress(map, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
         guard let base = CVPixelBufferGetBaseAddress(map) else { return [] }
@@ -186,11 +211,10 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         var out: [SIMD3<Double>] = []
         for py in stride(from: 0, to: h, by: 4) {
             let line = (base + py * row).assumingMemoryBound(to: Float32.self)
-            for px in stride(from: Int(Double(w) * 0.55), to: w, by: 4) {  // upright: the lower 45% of the picture
-                let z = Double(line[px])
-                guard z.isFinite, z >= 0.5, z <= 5 else { continue }
-                let u = (Double(px) + 0.5) / Double(w), v = (Double(py) + 0.5) / Double(h)
-                out.append(SIMD3((u - camera.cx) / camera.fx * z, (v - camera.cy) / camera.fy * z, z))
+            for px in stride(from: 0, to: w, by: 4) {
+                let p = rotation.upright(x: (Double(px) + 0.5) / Double(w), y: (Double(py) + 0.5) / Double(h)), z = Double(line[px])
+                guard p.y >= 0.55, z.isFinite, z >= 0.5, z <= 5 else { continue }  // the lower 45% of the picture
+                out.append(SIMD3((p.x - camera.cx) / camera.fx * z, (p.y - camera.cy) / camera.fy * z, z))
             }
         }
         return out
@@ -217,8 +241,8 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
                 let line = (base + y * row).assumingMemoryBound(to: Float32.self)
                 for x in stride(from: 0, to: lw, by: 4) {
                     let z = Double(line[x])
-                    guard z.isFinite, z >= 0.4, z <= 5,
-                          let p = crop.modelPoint(sensorX: (Double(x) + 0.5) / Double(lw), sensorY: (Double(y) + 0.5) / Double(lh)) else { continue }
+                    let u = rotation.upright(x: (Double(x) + 0.5) / Double(lw), y: (Double(y) + 0.5) / Double(lh))
+                    guard z.isFinite, z >= 0.4, z <= 5, let p = crop.modelPoint(x: u.x, y: u.y) else { continue }
                     out.append((value(Int(p.x * Double(mw)), Int(p.y * Double(mh))), z))
                 }
             }
@@ -227,11 +251,11 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         return fitDepth(pairs)
     }
 
-    /// The model's distance for a vehicle: median value in the middle of its box, converted with this frame's fit.
+    /// The model's distance for a vehicle (upright rect): median value in the middle of its box, converted with this frame's fit.
     private func modelDistance(of rect: CGRect, crop: DepthCrop) -> Double? {
         guard let map = depthMap, let fit = depthFit,
-              let a = crop.modelPoint(sensorX: Double(rect.midX - rect.width * 0.2), sensorY: Double(rect.midY + rect.height * 0.2)),
-              let b = crop.modelPoint(sensorX: Double(rect.midX + rect.width * 0.2), sensorY: Double(rect.midY - rect.height * 0.2)) else { return nil }
+              let a = crop.modelPoint(x: rect.midX - rect.width * 0.2, y: rect.midY - rect.height * 0.2),
+              let b = crop.modelPoint(x: rect.midX + rect.width * 0.2, y: rect.midY + rect.height * 0.2) else { return nil }
         let mw = Double(CVPixelBufferGetWidth(map)), mh = Double(CVPixelBufferGetHeight(map))
         let values = withHalfFloatMap(map) { value -> [Double] in
             var out: [Double] = []
@@ -256,6 +280,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
     private(set) var camera = ""
     private(set) var depthModel = "–"
     private(set) var road = "–"
+    private(set) var rotation = PictureRotation.portrait
     /// Which vision model finds the vehicles.
     var detector = CameraDetector.yolo26Large {
         didSet {
@@ -378,7 +403,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         // Focal length from the lens's field of view until LiDAR calibration data says better.
         let dims = device.activeFormat.formatDescription.dimensions
         let fx = 0.5 / tan(Double(device.activeFormat.videoFieldOfView) * .pi / 360)
-        worker.camera = CameraIntrinsics(fx: fx, fy: fx * Double(dims.width) / Double(dims.height))
+        worker.lens = CameraIntrinsics(fx: fx, fy: fx * Double(dims.width) / Double(dims.height))
         worker.onFrame = { [weak self] frame in
             guard let self else { return }
             Task { @MainActor in self.show(frame) }
@@ -400,6 +425,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         detectMs = frame.detectMs
         depthModel = frame.depthModel
         road = frame.road
+        rotation = frame.rotation
         if recording { recorded = frame.recorded }
         depth = frame.depth
         framesThisSecond += 1
@@ -416,16 +442,16 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
 /// "Car #3 · 12 m · reaches you in 1.8 s"
 private func trackLine(_ t: VehicleTrack) -> String {
     var parts = ["\(pretty(t.label)) #\(t.id)"]
-    if let d = t.distance { parts.append(String(format: "%.1f m (%@)", d, t.distanceFrom)) }
+    if let d = t.distance { parts.append("\(distanceText(d)) (\(t.distanceFrom))") }
     parts.append(t.timeToReach.map { String(format: "reaches you in %.1f s", $0) } ?? "not coming closer")
     return parts.joined(separator: " · ")
 }
 
-private func metres(_ m: Double?) -> String { m.map { String(format: "%.1f m", $0) } ?? "–" }
+private func metres(_ m: Double?) -> String { m.map(distanceText) ?? "–" }
 
 private func sideText(_ lateral: Double?) -> String {
     guard let l = lateral else { return "–" }
-    return abs(l) < 0.3 ? "on your path" : String(format: "%.1f m to your %@", abs(l), l > 0 ? "left" : "right")
+    return abs(l) < 0.3 ? "on your path" : "\(distanceText(abs(l))) to your \(l > 0 ? "left" : "right")"
 }
 
 final class CameraPreviewView: UIView {
@@ -443,14 +469,14 @@ final class CameraPreviewView: UIView {
 
     required init?(coder: NSCoder) { nil }
 
-    func show(_ tracks: [VehicleTrack]) {
-        if let c = preview.connection, c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }  // upright
+    func show(_ tracks: [VehicleTrack], rotation: PictureRotation) {
+        if let c = preview.connection, c.isVideoRotationAngleSupported(90) { c.videoRotationAngle = 90 }  // matches the portrait screen
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         boxes.frame = bounds
         boxes.sublayers = nil
         for t in tracks {
-            let r = preview.layerRectConverted(fromMetadataOutputRect: t.rect)
+            let r = preview.layerRectConverted(fromMetadataOutputRect: rotation.sensor(t.rect))
             let color = (t.warn ? UIColor.systemRed : .systemYellow).cgColor
             let box = CAShapeLayer()
             box.path = UIBezierPath(roundedRect: r, cornerRadius: 4).cgPath
@@ -459,13 +485,19 @@ final class CameraPreviewView: UIView {
             box.lineWidth = t.warn ? 4 : 2
             boxes.addSublayer(box)
             let text = CATextLayer()
-            text.string = "\(pretty(t.label)) " + (t.distance.map { String(format: "%.0f m", $0) } ?? "")
+            text.string = "\(pretty(t.label)) " + (t.distance.map(distanceText) ?? "")
                 + (t.timeToReach.map { String(format: " · %.1f s", $0) } ?? "")
             text.fontSize = 13
+            text.alignmentMode = .center
             text.foregroundColor = UIColor.black.cgColor
             text.backgroundColor = color
             text.contentsScale = traitCollection.displayScale
-            text.frame = CGRect(x: r.minX, y: max(r.minY - 18, 0), width: 170, height: 18)
+            // Readable the way the phone is held, just above the vehicle: held sideways, "up" is a side of the screen.
+            let angle = CGFloat(90 - rotation.rawValue) * .pi / 180, up = CGPoint(x: sin(angle), y: -cos(angle))
+            let reach = abs(up.x) * r.width / 2 + abs(up.y) * r.height / 2 + 9
+            text.bounds = CGRect(x: 0, y: 0, width: 170, height: 18)
+            text.position = CGPoint(x: r.midX + up.x * reach, y: r.midY + up.y * reach)
+            text.setAffineTransform(CGAffineTransform(rotationAngle: angle))
             boxes.addSublayer(text)
         }
         CATransaction.commit()
@@ -475,8 +507,9 @@ final class CameraPreviewView: UIView {
 struct CameraPreview: UIViewRepresentable {
     let session: AVCaptureSession
     let tracks: [VehicleTrack]
+    let rotation: PictureRotation
     func makeUIView(context: Context) -> CameraPreviewView { CameraPreviewView(session: session) }
-    func updateUIView(_ view: CameraPreviewView, context: Context) { view.show(tracks) }
+    func updateUIView(_ view: CameraPreviewView, context: Context) { view.show(tracks, rotation: rotation) }
 }
 
 struct CameraView: View {
@@ -489,11 +522,11 @@ struct CameraView: View {
     var body: some View {
         List {
             Section {
-                CameraPreview(session: camera.session, tracks: camera.tracks)
+                CameraPreview(session: camera.session, tracks: camera.tracks, rotation: camera.rotation)
                     .aspectRatio(3 / 4, contentMode: .fit)
                     .listRowInsets(EdgeInsets())
             } footer: {
-                Text("Hold or strap the phone upright with the back camera facing behind you. Yellow = vehicle, red = warning.")
+                Text("Hold or strap the phone upright or sideways (landscape sees more of the road to each side), back camera facing behind you. The motion sensor tells which way is up. Yellow = vehicle, red = warning.")
             }
             if let p = camera.problem {
                 Section { Label(p, systemImage: "exclamationmark.triangle").foregroundStyle(.orange) }
@@ -541,7 +574,7 @@ struct CameraView: View {
                         Text(trackLine(t)).font(.subheadline.bold()).foregroundStyle(t.warn ? .red : .primary)
                         Text("Closing \(t.closingSpeed.map { String(format: "%.1f m/s (%.0f km/h)", $0, $0 * 3.6) } ?? "–") · \(sideText(t.lateral)) · \(Int(t.confidence * 100))% sure")
                             .font(.caption).foregroundStyle(.secondary)
-                        Text("Each way: LiDAR \(metres(t.lidarDistance)) · size \(metres(t.sizeDistance))\(t.learnedHeight.map { String(format: " (its height %.2f m)", $0) } ?? "") · road \(metres(t.groundDistance)) · Depth Anything \(metres(t.modelDistance)) · width \(metres(t.widthDistance))")
+                        Text("Each way: LiDAR \(metres(t.lidarDistance)) · size \(metres(t.sizeDistance))\(t.learnedHeight.map { " (its height \(distanceText($0)))" } ?? "") · road \(metres(t.groundDistance)) · Depth Anything \(metres(t.modelDistance)) · width \(metres(t.widthDistance))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -567,6 +600,7 @@ struct CameraView: View {
             }
             Section {
                 LabeledContent("Camera", value: camera.camera.isEmpty ? "–" : camera.camera)
+                LabeledContent("Phone held", value: camera.rotation.name)
                 LabeledContent("Depth", value: camera.depth)
                 LabeledContent("Road", value: camera.road)
                 LabeledContent("Depth Anything", value: camera.depthModel)
