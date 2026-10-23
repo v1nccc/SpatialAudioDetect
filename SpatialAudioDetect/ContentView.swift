@@ -196,5 +196,8 @@ struct ContentView: View {
     selfCheck()
     hapticsSelfCheck()
     radarActivitySelfCheck()
+    vehicleTrackerSelfCheck()
+    depthModelSelfCheck()
+    groundPlaneSelfCheck()
     evaluationSelfCheck()
 }

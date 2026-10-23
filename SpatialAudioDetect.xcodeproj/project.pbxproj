@@ -359,6 +359,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Used on this iPhone only, while the camera test is open, to spot vehicles coming up behind you and measure how close they are.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Used to detect which direction sounds come from.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Used on this iPhone only to notice when someone says your name or a danger word like “watch out”.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;
@@ -403,6 +404,7 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "Used on this iPhone only, while the camera test is open, to spot vehicles coming up behind you and measure how close they are.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Used to detect which direction sounds come from.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Used on this iPhone only to notice when someone says your name or a danger word like “watch out”.";
 				INFOPLIST_KEY_NSSupportsLiveActivities = YES;

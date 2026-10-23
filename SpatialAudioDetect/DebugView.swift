@@ -19,6 +19,11 @@ struct DebugView: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    NavigationLink { CameraView(radar: radar) } label: {
+                        Label("Camera test (LiDAR + vehicle detection)", systemImage: "camera.viewfinder")
+                    }
+                }
                 recordSection
                 soundModelSection
                 if let d = radar.debug {
