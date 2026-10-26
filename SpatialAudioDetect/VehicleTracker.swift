@@ -78,7 +78,10 @@ nonisolated func distanceText(_ m: Double) -> String {
 nonisolated enum DistanceMethod: String, CaseIterable, Sendable {
     case calculation = "Calculation"                      // LiDAR ≤ 5 m; beyond: its height in the picture, fused with where it meets the road
     case calculationDepth = "Calculation + Depth Anything"  // the same, plus the AI depth model
+    case depthAnything = "Depth Anything only"            // just the AI depth model (scaled to metres by LiDAR each frame)
     case widthFormula = "OpenCV method (known width)"     // the paper's triangle similarity: real width × focal ÷ width in pixels
+
+    var usesDepthModel: Bool { self == .calculationDepth || self == .depthAnything }
 }
 
 /// Typical real size (m) per label: height for distance from size, width for the OpenCV method. Two-wheelers include the rider.
@@ -217,6 +220,7 @@ nonisolated struct VehicleTrack: Sendable, Identifiable {
     var learnedHeight: Double?        // its real height, measured by LiDAR when it was within 5 m
     var heights: [Double] = []
     var filter = DistanceFilter()
+    var measuredAt: Double?           // when the filter last had a measurement
 }
 
 /// Follows vehicles across frames and keeps each one's numbers current.
@@ -280,7 +284,6 @@ nonisolated struct VehicleTracker {
     private mutating func add(_ d: VehicleDetection, to i: Int, at t: Double, camera: CameraIntrinsics, road: GroundPlane?,
                               method: DistanceMethod, settings: CameraSettings) {
         var k = tracks[i]
-        let dt = k.hits == 0 ? 0 : t - k.lastSeen
         if d.confidence >= k.confidence - 0.1 { k.label = d.label }
         k.confidence = d.confidence
         k.rect = d.rect
@@ -313,23 +316,29 @@ nonisolated struct VehicleTracker {
         var from = "size"
         if let g = k.groundDistance, g <= 15 { parts.append((g, 0.04 + 0.006 * g)); from += " + road" }
         if method == .calculationDepth, let m = k.modelDistance { parts.append((m, 0.05 + 0.01 * m)); from += " + Depth Anything" }
-        let measured: (z: Double, sigma: Double)
+        let measured: (z: Double, sigma: Double)?
         switch method {
         case .widthFormula:
             measured = (k.widthDistance!, 0.3 * k.widthDistance!)
             from = "width"
+        case .depthAnything:  // by itself, even within LiDAR range; nothing until it has a reading
+            measured = k.modelDistance.map { ($0, (0.05 + 0.01 * $0) * $0) }
+            from = measured == nil ? "Depth Anything: no reading yet" : "Depth Anything"
         case _ where lidar != nil:
             measured = (lidar!, 0.05)
             from = "LiDAR"
         default:
             measured = fused(parts)
         }
-        k.filter.update(measured.z, sigma: measured.sigma, dt: dt)
-        k.distance = max(k.filter.d, 0.3)
+        if let measured {
+            k.filter.update(measured.z, sigma: measured.sigma, dt: k.filter.updates == 0 ? 0 : t - (k.measuredAt ?? t))
+            k.measuredAt = t
+            k.distance = max(k.filter.d, 0.3)
+        }
         k.distanceFrom = from
         k.closingSpeed = k.filter.updates >= 5 ? -k.filter.v : nil
         // Looking backward, the picture's right is your left.
-        k.lateral = (Double(d.rect.midX) - camera.cx) / camera.fx * k.distance!
+        k.lateral = k.distance.map { (Double(d.rect.midX) - camera.cx) / camera.fx * $0 }
 
         // Picture size ∝ 1 / distance, so d(ln size)/dt = closing speed ÷ distance = 1 / seconds until it reaches you.
         k.samples.append(.init(t: t, size: size))
@@ -340,7 +349,7 @@ nonisolated struct VehicleTracker {
         // closer (box jitter alone reads as ~30 s; nothing that far off needs a warning).
         let lag = t - window.map(\.t).reduce(0, +) / Double(max(window.count, 1))
         k.timeToReach = growth.flatMap { $0 > 1 / 10 ? max(1 / $0 - lag, 0) : nil }
-        let closingNear = k.fromLidar && k.distance! <= 3 && (k.closingSpeed ?? 0) > 1
+        let closingNear = k.fromLidar && (k.distance ?? .infinity) <= 3 && (k.closingSpeed ?? 0) > 1
         k.warn = k.confirmed && settings.warnObjects.contains(k.label)
             && (((k.timeToReach ?? .infinity) <= settings.warnSeconds && abs(k.lateral ?? 0) <= settings.warnSide) || closingNear)
         tracks[i] = k
@@ -460,6 +469,16 @@ nonisolated func vehicleTrackerSelfCheck() {
     }
     precondition(abs(vanAt20!.learnedHeight! - 1.9) < 0.05 && abs(vanAt20!.sizeDistance! - 20) < 1, "learned 1.9 m height -> \(vanAt20!)")
     precondition(abs(vanAt20!.widthDistance! - 20) < 1, "known width: 1.8 m wide car at 20 m -> \(vanAt20!.widthDistance!)")
+
+    // Depth Anything only: no distance until the model has a reading, then its number, even with LiDAR in range.
+    var depthOnly = VehicleTracker()
+    let carBox = box(distance: 4, left: 0, height: 1.5)
+    let waiting = depthOnly.update([VehicleDetection(label: "car", confidence: 0.9, rect: carBox)],
+                                   at: 0, camera: camera, method: .depthAnything)
+    precondition(waiting[0].distance == nil && waiting[0].lateral == nil, "no reading yet: no distance -> \(waiting[0])")
+    let read = depthOnly.update([VehicleDetection(label: "car", confidence: 0.9, rect: carBox, lidar: 4, modelDepth: 4.4)],
+                                at: 1.0 / 30, camera: camera, method: .depthAnything)
+    precondition(read[0].distance == 4.4 && read[0].distanceFrom == "Depth Anything", "the model's own number -> \(read[0])")
 
     // Custom settings: only detect selected objects, and optionally allow person warnings.
     var customSettings = CameraSettings()

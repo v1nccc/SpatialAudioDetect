@@ -154,7 +154,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
         let pw = Double(CVPixelBufferGetWidth(pixels)), ph = Double(CVPixelBufferGetHeight(pixels))
         let crop = DepthCrop(uprightAspect: rotation.rawValue % 180 == 0 ? pw / ph : ph / pw, modelAspect: 518.0 / 392)
         frameCount += 1
-        let useDepthModel = method == .calculationDepth
+        let useDepthModel = method.usesDepthModel
         if useDepthModel, let depthRequest, frameCount % 3 == 0 {
             let started = CACurrentMediaTime()
             depthRequest.regionOfInterest = crop.region
@@ -223,7 +223,7 @@ nonisolated final class CameraWorker: NSObject, AVCaptureDataOutputSynchronizerD
 
     private var depthStatus: String {
         guard depthRequest != nil else { return "model missing from the app" }
-        guard method == .calculationDepth else { return "off (pick \"\(DistanceMethod.calculationDepth.rawValue)\")" }
+        guard method.usesDepthModel else { return "off (pick a Depth Anything distance method)" }
         guard depthMap != nil else { return "starting…" }
         guard let f = depthFit else { return String(format: "not calibrated: too few LiDAR points 0.4–5 m · %.0f ms", depthMs) }
         return String(format: "fit on %d LiDAR points · R² %.2f · %.0f ms", f.points, f.r2, depthMs)
@@ -898,6 +898,7 @@ struct CameraView: View {
                     Detector: YOLO26s at 960×736 sees farther objects; at 640 it runs faster; YOLOv3 is the legacy model.
                     Distance — Calculation: uses direct LiDAR depth within 5 m; beyond 5 m, combines the object's apparent height (calibrated by LiDAR when close, or reference height) with the LiDAR-fitted road plane up to 15 m, smoothed with a Kalman filter.
                     + Depth Anything: adds the neural depth map calibrated against LiDAR each frame.
+                    Depth Anything only: just the neural depth map's number, even within 5 m. This model only knows nearer/farther, so LiDAR readings 0.4–5 m away still set its scale each frame; far away that's an extrapolation.
                     OpenCV method: triangle similarity using reference object width.
                     """)
             }

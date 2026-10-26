@@ -37,7 +37,7 @@ nonisolated func drawOverlay(_ tracks: [VehicleTrack], on pixels: CVPixelBuffer,
         ctx.setLineWidth(t.warn ? 8 : 4)
         ctx.stroke(box)
         var text = pretty(t.label)
-        if let d = t.distance { text += " \(distanceText(d))\(t.fromLidar ? " LiDAR" : "")" }
+        if let d = t.distance { text += " \(distanceText(d))\(t.distanceFrom == "LiDAR" ? " LiDAR" : "")" }
         if let m = t.modelDistance { text += " (DA \(distanceText(m)))" }
         if let s = t.timeToReach { text += String(format: " · %.1f s", s) }
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [
