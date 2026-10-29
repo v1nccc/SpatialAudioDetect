@@ -16,6 +16,18 @@ struct HapticsView: View {
         NavigationStack {
             Form {
                 levelsSection
+                Section {
+                    Toggle("Confirmation rules", isOn: Binding(get: { radar.confirmRules }, set: { radar.confirmRules = $0 }))
+                } header: {
+                    Text("Recognition")
+                } footer: {
+                    Text("""
+                        On: a sound must be convincing before it warns: a siren in 2 of 3 half-second windows, a bell, dog or \
+                        shout once strongly (≥ 70%) or twice in a row (≥ 50%); a horn once (≥ 30%). Off: any alert sound \
+                        scoring ≥ 30% in one window warns, often 0.25–0.75 s sooner but with more false alarms. For the Sound \
+                        Radar method; Audio Lab never confirms.
+                        """)
+                }
                 wordsSection
                 patternSection("Critical vibration", $settings.critical)
                 patternSection("Warning vibration", $settings.warning)

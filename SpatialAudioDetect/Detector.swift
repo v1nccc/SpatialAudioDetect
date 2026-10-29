@@ -297,8 +297,10 @@ nonisolated func alertName(_ label: String) -> (what: String, short: String) {
 /// Which alert sound to report from one classifier window (best score per label across the all-around mic and the
 /// beams) and the last few windows' siren scores: critical kinds first, then the highest score.
 /// An ongoing sound (`current`, any label of its family) keeps priority over a new one of the same rank.
-nonisolated func pickAlert(_ best: [String: Double], trails: [String: [Double]], current: String? = nil) -> (label: String, score: Double)? {
-    let passing = best.filter { convincing($0.key, trails[familyKey($0.key)] ?? [$0.value]) }
+/// `confirm` off: no confirmation rules, any alert sound ≥ alertThreshold in this one window passes (faster, more false alarms).
+nonisolated func pickAlert(_ best: [String: Double], trails: [String: [Double]], current: String? = nil,
+                           confirm: Bool = true) -> (label: String, score: Double)? {
+    let passing = best.filter { confirm ? convincing($0.key, trails[familyKey($0.key)] ?? [$0.value]) : $0.value >= alertThreshold }
     func rank(_ label: String) -> Int { alwaysCritical.contains(label) ? 2 : horns.contains(label) ? 1 : 0 }
     let ongoing = current.map(family(of:)) ?? []
     func key(_ l: String, _ s: Double) -> (Int, Int, Double) { (rank(l), ongoing.contains(l) ? 1 : 0, s) }
@@ -763,6 +765,7 @@ nonisolated struct Detector {
     static let arrowSeconds = 0.3
 
     var offset = 0.0, mirror = false  // the user's fine-tune
+    var confirm = true                 // confirmation rules (Alerts › Confirmation rules); off = warn on the first window
     var bins = [Bin](repeating: Bin(), count: 72)  // 5° per spoke
     private(set) var kind = SoundKind.other
     private(set) var label = ""
@@ -869,7 +872,7 @@ nonisolated struct Detector {
             listeners.append(ListenerScore(name: name, label: top?.key ?? "", score: top?.value ?? 0))
         }
         let ongoing = alert != nil && clock <= alertUntil ? currentLabel : nil
-        guard let pick = pickAlert(best, trails: scoreTrails, current: ongoing) else {
+        guard let pick = pickAlert(best, trails: scoreTrails, current: ongoing, confirm: confirm) else {
             lastJudged = JudgedWindow(label: "", score: best.values.max() ?? 0, beamScores: [], sources: [], beamPointing: nil,
                                       azimuth: nil, listeners: listeners)
             return
@@ -1101,6 +1104,10 @@ nonisolated func selfCheck() {
     precondition(pickAlert(["siren": 0.6], trails: [sk: [0.6, 0.2, 0.6]]) != nil, "2 of the last 3 is")
     precondition(pickAlert(["car_horn": 0.35], trails: [familyKey("car_horn"): [0.35]]) != nil, "a short honk counts at once")
     precondition(pickAlert(["dog_bark": 0.6], trails: [familyKey("dog_bark"): [0.1, 0.6]]) == nil, "a single 0.6 bark: not yet")
+    // Confirmation rules off: the first window over the alert bar counts, still critical sounds first.
+    precondition(pickAlert(["siren": 0.6], trails: [sk: [0.1, 0.6]], confirm: false)?.label == "siren", "rules off: one siren window")
+    precondition(pickAlert(["dog_bark": 0.35, "siren": 0.31], trails: [:], confirm: false)?.label == "siren", "rules off: siren still first")
+    precondition(pickAlert(["dog_bark": 0.25], trails: [:], confirm: false) == nil, "rules off: still needs the alert bar")
     precondition(pickAlert(["screaming": 0.8, "emergency_vehicle": 0.6], trails: [familyKey("screaming"): [0.8], sk: [0.6, 0.6]],
                            current: "police_siren")!.label == "emergency_vehicle", "ongoing siren keeps priority")
     precondition(alertName("emergency_vehicle").what == "Siren" && alertName("air_horn").short == "Horn", "one name per family")

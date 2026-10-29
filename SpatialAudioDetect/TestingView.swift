@@ -104,6 +104,9 @@ struct TestingView<Live: View>: View {
                 Picker("Detection method", selection: $method) {
                     ForEach([DetectionMethod.soundRadar, .audioLab], id: \.self) { Text($0.rawValue) }
                 }
+                if method == .soundRadar {
+                    Toggle("Confirmation rules", isOn: Binding(get: { radar.confirmRules }, set: { radar.confirmRules = $0 }))
+                }
                 Picker("Phone carried in", selection: $conditions.carry) { ForEach(EvalConditions.carries, id: \.self) { Text($0) } }
                 Picker("Activity", selection: $conditions.activity) { ForEach(EvalConditions.activities, id: \.self) { Text($0) } }
                 Picker("Place", selection: $conditions.place) { ForEach(EvalConditions.places, id: \.self) { Text($0) } }
@@ -126,7 +129,9 @@ struct TestingView<Live: View>: View {
                 Text("""
                     The app then works exactly as it does for a runner, and records: the sound (to listen back, ~0.5 MB per \
                     minute; the 4-channel audio for replaying on a Mac adds ~46 MB per minute), every alert with its direction \
-                    and vibration, the decisions log and battery use. Afterwards open the test and mark each alert true or false.
+                    and vibration, the decisions log and battery use. Afterwards open the test and mark each alert true or false. \
+                    Confirmation rules off: Sound Radar warns on the first half second an alert sound scores ≥ 30% (faster, more \
+                    false alarms); the same switch is in Alerts, and each test records which way it was.
                     """)
             }
             Section("History (\(history.count))") {
@@ -166,7 +171,8 @@ struct TestingView<Live: View>: View {
                         Label("Recording · \(clock(context.date.timeIntervalSince(s.started)))", systemImage: "record.circle.fill")
                             .font(.headline).foregroundStyle(.red)
                     }
-                    Text("\(s.alerts.count) alerts · \(s.marks.count) flagged · \(radar.method.rawValue) · battery \(battery)")
+                    Text("\(s.alerts.count) alerts · \(s.marks.count) flagged · \(radar.method.rawValue)"
+                         + (radar.method == .soundRadar ? " · confirmation \(radar.confirmRules ? "on" : "off")" : "") + " · battery \(battery)")
                         .font(.subheadline).foregroundStyle(.secondary)
                     Text("Noticed a danger? Tap it the moment you do, so the ones the app misses count too.")
                         .font(.caption).foregroundStyle(.secondary)

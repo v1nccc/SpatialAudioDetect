@@ -99,7 +99,11 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     /// One per app: the screen, the Dynamic Island buttons and the Lock Screen buttons all drive this.
     static let shared = SoundRadar()
 
-    private(set) var detector = Detector()
+    private(set) var detector: Detector = {
+        var d = Detector()
+        d.confirm = UserDefaults.standard.object(forKey: "confirmRules") as? Bool ?? true
+        return d
+    }()
     var problem: String?
     var debug: DebugSnapshot?      // refreshed 10×/s for the debug screen
     private(set) var recorder: Recorder?
@@ -125,6 +129,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     /// tab, whichever was opened last. Both always run, for the Compare tab.
     var method = DetectionMethod.soundRadar {
         didSet { if method != oldValue { log("detection method: \(method.rawValue)") } }
+    }
+
+    /// Sound Radar's confirmation rules (a siren in 2 of 3 windows, a bark strong or twice…), kept across launches.
+    /// Off: it warns on the first window an alert sound scores ≥ 0.3: faster, more false alarms. Audio Lab has none.
+    var confirmRules = UserDefaults.standard.object(forKey: "confirmRules") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(confirmRules, forKey: "confirmRules")
+            detector.confirm = confirmRules
+            if confirmRules != oldValue { log("confirmation rules: \(confirmRules ? "on" : "off")") }
+        }
     }
 
     // What the main screen reads, from the method in use

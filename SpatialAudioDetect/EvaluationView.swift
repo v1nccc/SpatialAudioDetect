@@ -138,6 +138,7 @@ func automaticConditions(_ conditions: EvalConditions, radar: SoundRadar) -> Eva
     var c = conditions
     let d = UserDefaults.standard
     c.model = "\(radar.engine.rawValue) · \(radar.method.rawValue)"
+        + (radar.method == .soundRadar ? " · confirmation \(radar.confirmRules ? "on" : "off")" : "")
     c.fineTune = "rotate \(Int(d.double(forKey: "rotate")))°\(d.bool(forKey: "mirror") ? ", mirrored" : "")"
     c.device = machineName()
     c.system = "iOS " + UIDevice.current.systemVersion
