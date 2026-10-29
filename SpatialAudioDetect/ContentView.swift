@@ -314,6 +314,7 @@ struct RadarCard: View {
     selfCheck()
     audioLabSelfCheck()
     screenFrameSelfCheck()
+    warningLogSelfCheck()
     hapticsSelfCheck()
     radarActivitySelfCheck()
     vehicleTrackerSelfCheck()

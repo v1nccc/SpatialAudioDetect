@@ -6,16 +6,17 @@ import simd
 /// listen.m4a   the all-around channel as AAC, to listen back to (~0.5 MB per minute)
 /// blocks.csv   every audio block (~47/s) and every number computed from it
 /// verdicts.csv every classifier verdict (4/s) with Apple's raw top labels
-/// events.txt   the decisions log
+/// events.txt   the decisions log, including "SHOWN" lines: each warning on screen as it starts, turns, ends
+/// warnings.csv the same warnings as a spreadsheet: time into the recording, what, level, direction (degrees and words)
 /// display.jsonl what the main screen showed, ~10 times a second, timed to the audio (to replay a test as it looked)
 final class Recorder {
     static let blockColumns = ["t", "duration", "db", "directness", "raw_azimuth", "heading_correction", "azimuth",
                                "hum_db", "usual_db", "loudness", "strength", "W_db", "X_db", "Y_db", "Z_db"]
         + phoneSides.map { $0.name.lowercased().replacingOccurrences(of: " ", with: "_") + "_db" }
-        + ["gx", "gy", "gz", "yaw_rate", "kind", "alert", "audio_saved"]
+        + ["gx", "gy", "gz", "yaw_rate", "kind", "alert", "alert_azimuth", "audio_saved"]
 
     let folder: URL, audio: URL, listen: URL, startedAt: Double
-    private let blocks: FileHandle, verdicts: FileHandle, events: FileHandle, display: FileHandle
+    private let blocks: FileHandle, verdicts: FileHandle, events: FileHandle, display: FileHandle, warnings: FileHandle
     private var audioStart: Double?  // stream time of the recording's first audio sample
     private let encoder = JSONEncoder()
 
@@ -35,6 +36,7 @@ final class Recorder {
         verdicts = try open("verdicts.csv", "start,end,received,kind,label,alert_score,top_labels,source\n")
         events = try open("events.txt", "")
         display = try open("display.jsonl", "")
+        warnings = try open("warnings.csv", "recording_s,event,what,level,azimuth,direction,method\n")
         folder = dir
         audio = dir.appending(path: "audio.caf")
         listen = dir.appending(path: "listen.m4a")
@@ -42,7 +44,7 @@ final class Recorder {
     }
 
     var files: [URL] {
-        ["audio.caf", "listen.m4a", "blocks.csv", "verdicts.csv", "events.txt", "display.jsonl"].map { folder.appending(path: $0) }
+        ["audio.caf", "listen.m4a", "blocks.csv", "verdicts.csv", "events.txt", "warnings.csv", "display.jsonl"].map { folder.appending(path: $0) }
             .filter { FileManager.default.fileExists(atPath: $0.path(percentEncoded: false)) }
     }
 
@@ -64,7 +66,8 @@ final class Recorder {
         let signal: [String] = [f(b.start, 3), f(b.duration, 4), f(r.db), f(r.directness, 3), opt(p.rawAzimuth),
                                 f(p.correction), opt(p.azimuth), opt(p.hum), opt(p.usual), f(p.loudness, 3), f(p.strength, 3)]
         let channels: [String] = [db(r.ww), db(r.xx), db(r.yy), db(r.zz)] + phoneSides.map { f(r.micDB($0)) }
-        let rest: [String] = [f(g.x, 3), f(g.y, 3), f(g.z, 3), f(p.motion.yawRate, 4), "\(kind)", alert.map { "\($0.level == .critical ? "critical" : "warning"): \($0.what)" } ?? "", b.savingAudio ? "1" : "0"]
+        let rest: [String] = [f(g.x, 3), f(g.y, 3), f(g.z, 3), f(p.motion.yawRate, 4), "\(kind)", alert.map { "\($0.level == .critical ? "critical" : "warning"): \($0.what)" } ?? "",
+                              opt(alert?.azimuth), b.savingAudio ? "1" : "0"]
         let cols = signal + channels + rest
         assert(cols.count == Self.blockColumns.count, "blocks.csv row doesn't match its header")
         write(blocks, cols.joined(separator: ","))
@@ -79,8 +82,15 @@ final class Recorder {
 
     func event(_ line: String) { write(events, line) }
 
+    /// A warning on screen started, turned or ended (WarningLog), at `t` seconds into the recording.
+    func warning(_ event: WarningLog.Event, _ a: Alert, method: String, at t: Double?) {
+        let row = [t.map { String(format: "%.2f", $0) } ?? "", event.rawValue, a.what, a.level == .critical ? "critical" : "warning",
+                   a.azimuth.map { String(Int($0.rounded())) } ?? "", directionWords(a.azimuth), method]
+        try? warnings.write(contentsOf: Data(csv([row]).utf8))
+    }
+
     func close() {
-        for h in [blocks, verdicts, events, display] { try? h.close() }
+        for h in [blocks, verdicts, events, display, warnings] { try? h.close() }
     }
 
     private func write(_ h: FileHandle, _ line: String) {
@@ -156,4 +166,65 @@ nonisolated func screenFrameSelfCheck() {
                  && lit[1].element.kind == .alert, "lines -> \(back.lines)")
     let frames = [0.0, 0.1, 0.2, 0.3].map { ScreenFrame(t: $0, alert: nil, kind: .other, bins: [], traffic: nil, people: nil, recognitionDown: false) }
     precondition(screenFrame(at: -0.05, in: frames) == nil && screenFrame(at: 0.15, in: frames)?.t == 0.1 && screenFrame(at: 9, in: frames)?.t == 0.3, "lookup")
+}
+
+/// The warning on screen, as the runner gets it: logged when it starts, each time its direction turns by 20° or more
+/// (it follows its sound every block), and when it ends, with the direction it showed last.
+nonisolated struct WarningLog {
+    nonisolated enum Event: String, Sendable { case started, turned, ended }
+    static let turnDegrees = 20.0
+    private var logged: Alert?  // as last written
+    private var shown: Alert?   // as on screen now
+
+    /// What changed since the last call, if worth a line.
+    mutating func update(_ a: Alert?) -> (event: Event, alert: Alert)? {
+        defer { shown = a }
+        guard let a else {
+            guard let last = shown ?? logged else { return nil }
+            logged = nil
+            return (.ended, last)
+        }
+        guard let old = logged, old.what == a.what, old.level == a.level else {
+            logged = a
+            return (.started, a)
+        }
+        let turned = switch (old.azimuth, a.azimuth) {
+        case let (x?, y?): angularDistance(x, y) >= Self.turnDegrees
+        case (nil, nil): false
+        default: true  // gained or lost its direction
+        }
+        guard turned else { return nil }
+        logged = a
+        return (.turned, a)
+    }
+
+    /// The decisions-log line: "SHOWN (Sound Radar): Watch out, Horn, 135° behind on your left".
+    static func line(_ e: Event, _ a: Alert, method: String) -> String {
+        let at = a.azimuth.map { "\(Int($0.rounded()))° \(directionWords($0))" } ?? "direction unclear"
+        return switch e {
+        case .started: "SHOWN (\(method)): \(a.level == .critical ? "Watch out" : "Heads up"), \(a.what), \(at)"
+        case .turned: "SHOWN (\(method)): \(a.what) turned to \(at)"
+        case .ended: "SHOWN (\(method)): \(a.what) ended, last \(at)"
+        }
+    }
+}
+
+nonisolated func warningLogSelfCheck() {
+    func horn(_ az: Double?, _ level: AlertLevel = .critical) -> Alert { Alert(azimuth: az, what: "Horn", level: level, short: "Horn") }
+    var w = WarningLog()
+    precondition(w.update(nil) == nil, "nothing on screen: nothing to log")
+    precondition(w.update(horn(135))?.event == .started, "starts")
+    precondition(w.update(horn(145)) == nil && w.update(horn(150)) == nil, "following its sound by a few degrees: no line")
+    let turn = w.update(horn(172))
+    precondition(turn?.event == .turned && turn?.alert.azimuth == 172, "37° from the logged 135°: turned")
+    precondition(w.update(horn(-170)) == nil, "across ±180°: 18° from 172°, not a turn")
+    precondition(w.update(horn(nil))?.event == .turned, "lost its direction")
+    precondition(w.update(horn(nil, .warning))?.event == .started, "a different level is a new warning")
+    _ = w.update(horn(170, .warning))
+    _ = w.update(horn(172, .warning))
+    let end = w.update(nil)
+    precondition(end?.event == .ended && end?.alert.azimuth == 172, "ends with the direction it showed last -> \(String(describing: end))")
+    precondition(w.update(nil) == nil, "ended once")
+    precondition(WarningLog.line(.started, horn(135), method: "Sound Radar") == "SHOWN (Sound Radar): Watch out, Horn, 135° behind on your left",
+                 WarningLog.line(.started, horn(135), method: "Sound Radar"))
 }

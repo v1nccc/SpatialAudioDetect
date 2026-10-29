@@ -254,7 +254,9 @@ struct TestSessionView: View {
                     Text("""
                         One zip: timeline.csv (every alert and flagged sound with its time, direction and your three verdicts), \
                         by_sound.csv, summary.csv, alerts.csv, session.json, and the recording: listen.m4a, audio.caf (replay it \
-                        on a Mac with Tools/replay.swift), blocks.csv, verdicts.csv (every classifier answer) and events.txt.
+                        on a Mac with Tools/replay.swift), warnings.csv (every warning as you got it: when it started, \
+                        each 20° turn and when it ended, with its direction), blocks.csv, verdicts.csv (every classifier \
+                        answer) and events.txt (the decisions log).
                         """)
                 }
                 Section {

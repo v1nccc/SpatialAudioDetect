@@ -185,6 +185,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     private let motion = CMMotionManager()
     @ObservationIgnored private var nextDebug = 0.0
     @ObservationIgnored private var nextFrame = 0.0  // next screen frame for the recording's replay
+    @ObservationIgnored private var warnings = WarningLog()  // the warning on screen, for the log and warnings.csv
     @ObservationIgnored private var lastBlockAt: Date?
     @ObservationIgnored private var lastNotified: (what: String, at: Date)?
     @ObservationIgnored private var startRequested = false
@@ -226,10 +227,11 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     /// End the session: mic off, warnings cleared, recording closed, Dynamic Island removed.
     func stop() {
         if listeningStarted {
+            detector.clearAlert()
+            logWarning()  // before the recording closes, so it ends there too
             if recorder != nil { toggleRecording() }
             listeningStarted = false
             paused = false
-            detector.clearAlert()
             held = nil
             let session = session
             queue.async { session.stopRunning() }
@@ -249,6 +251,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         paused = pause
         if pause {
             detector.clearAlert()
+            logWarning()  // the warning on screen ends with the pause
             held = nil
         } else {
             lastBlockAt = .now  // give the mic a moment before calling it stalled
@@ -416,6 +419,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         blocksThisSecond += 1
         react(since: pulse)
         recorder?.block(p, kind: kind, alert: alert)
+        logWarning()
         // What the screen shows, 10 times a second, so a test can be replayed as it looked.
         if let r = recorder, detector.clock >= nextFrame, let t = r.audioTime(detector.clock) {
             nextFrame = detector.clock + 0.1
@@ -440,6 +444,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         let pulse = alertPulse
         detector.heardWords(phrase, isName: isName, from: start, to: end)
         react(since: pulse)
+        logWarning()
         flushLog()
     }
 
@@ -450,7 +455,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         EvalStore.shared.observe(alert, audioAt: recordingTime)
         react(since: pulse)
         recorder?.verdict(h, received: detector.clock)
+        logWarning()
         flushLog()
+    }
+
+    /// The warning on screen (from the method in use) started, turned or ended: a "SHOWN" line in the decisions log,
+    /// and a row in the recording's warnings.csv.
+    private func logWarning() {
+        guard let (event, a) = warnings.update(alert) else { return }
+        log(WarningLog.line(event, a, method: method.rawValue))
+        recorder?.warning(event, a, method: method.rawValue, at: recordingTime)
     }
 
     /// Feel the warning: the user's pattern for this kind of alert (from here, not a SwiftUI view, so it also
