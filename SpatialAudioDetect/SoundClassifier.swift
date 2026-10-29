@@ -2,7 +2,7 @@
 import CoreML
 @preconcurrency import SoundAnalysis
 
-nonisolated enum SoundKind: Sendable { case other, people, traffic, alert }
+nonisolated enum SoundKind: String, Codable, CaseIterable, Sendable { case other, people, traffic, alert }
 
 /// Which of Apple's built-in classifier labels matter to a runner who can't hear them.
 nonisolated let soundKinds: [String: SoundKind] = {

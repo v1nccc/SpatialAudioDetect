@@ -3,7 +3,7 @@ import AVFoundation
 // Replays 4-channel ambisonic audio through the app's own pipeline (Detector.swift + SoundClassifier.swift)
 // on a Mac, so warnings can be counted and thresholds tuned on real street audio. From the project folder:
 //
-//   swiftc -O SpatialAudioDetect/Detector.swift SpatialAudioDetect/SoundClassifier.swift Tools/replay.swift -o /tmp/replay
+//   swiftc -O SpatialAudioDetect/Detector.swift SpatialAudioDetect/AudioLab.swift SpatialAudioDetect/SoundClassifier.swift Tools/replay.swift -o /tmp/replay
 //   /tmp/replay <recording folder>   a walk recorded with Debug › Record session (audio.caf + blocks.csv)
 //   /tmp/replay --street             a synthetic 90 s street where the right answer is known
 //   /tmp/replay --selfcheck          the app's self-check
@@ -34,12 +34,21 @@ func replay(_ name: String, next: () -> AVAudioPCMBuffer?, motion: (Double) -> M
     let heard = verdicts.all.sorted { $0.end < $1.end }
 
     var d = Detector(), v = 0, lit = 0, log: [String] = []
-    var onsets: [(t: Double, what: String, azimuth: Double?)] = []
+    var onsets: [(t: Double, what: String, azimuth: Double?)] = [], labOnsets = onsets
+    var labWindows = 0, labDirections = 0, lastWindow = -1.0  // Audio Lab: 0.1 s windows, and how many gave a direction
     func step(_ change: (inout Detector) -> Void) {
-        let before = d.alert
+        let before = d.alert, labBefore = d.lab.alert
         change(&d)
         if let a = d.alert, a.what != before?.what || a.level != before?.level {
             onsets.append((d.clock, "\(a.level == .critical ? "CRITICAL" : "warning") · \(a.what)", a.azimuth))
+        }
+        if let a = d.lab.alert, a.what != labBefore?.what || a.level != labBefore?.level {
+            labOnsets.append((d.clock, "\(a.level == .critical ? "CRITICAL" : "warning") · \(a.what)", a.azimuth))
+        }
+        if let w = d.lab.latest, w.t != lastWindow {
+            lastWindow = w.t
+            labWindows += 1
+            if w.azimuth != nil { labDirections += 1 }
         }
         log += d.pendingLog
         d.clearPendingLog()
@@ -65,6 +74,12 @@ func replay(_ name: String, next: () -> AVAudioPCMBuffer?, motion: (Double) -> M
     print("Not warned (filtered out): \(notWarned.count)")
     notWarned.forEach { print("  " + $0) }
     print(String(format: "Radar: %.1f of 72 spokes lit on average", Double(lit) / Double(max(blocks.count, 1))))
+    print(String(format: "Audio Lab (prototype method): a direction in %d of %d windows (%.0f%%); watch out: %d onsets",
+                 labDirections, labWindows, 100 * Double(labDirections) / Double(max(labWindows, 1)), labOnsets.count))
+    for what in Set(labOnsets.map(\.what)).sorted() {
+        let these = labOnsets.filter { $0.what == what }
+        print("  \(what) ×\(these.count): " + these.map { String(format: "%.1fs ", $0.t) + at($0.azimuth) }.joined(separator: ", "))
+    }
 }
 
 /// A recording made with Debug › Record session: audio.caf, plus phone motion per block from blocks.csv.
@@ -185,6 +200,7 @@ func street() -> (next: () -> AVAudioPCMBuffer?, motion: (Double) -> Motion) {
         switch args.first {
         case "--selfcheck":
             selfCheck()
+            audioLabSelfCheck()
             print("self-check OK")
         case "--street":
             print(streetTruth)

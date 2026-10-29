@@ -19,6 +19,9 @@ extension SoundKind {
 
 enum AppTab: String {
     case soundRadar
+    case audioLab
+    case compare
+    case testing
     case camera
 }
 
@@ -66,6 +69,45 @@ struct ContentView: View {
             }
             .tag(AppTab.soundRadar)
 
+            // The same screen, driven by the Audio Lab prototype's method (radar.method follows the tab).
+            NavigationStack {
+                ScrollView {
+                    VStack(spacing: 16) {
+                        statusCard
+                        radarCard
+                        labCard
+                        controls
+                    }
+                    .padding()
+                }
+                .background { (radar.alert?.level.color ?? Color(.systemGroupedBackground)).ignoresSafeArea() }
+                .navigationTitle("Audio Lab")
+                .navigationBarTitleDisplayMode(.inline)
+            }
+            .tabItem {
+                Label("Audio Lab", systemImage: "flask")
+            }
+            .tag(AppTab.audioLab)
+
+            NavigationStack {
+                CompareView(radar: radar)
+            }
+            .tabItem {
+                Label("Compare", systemImage: "square.split.2x1")
+            }
+            .tag(AppTab.compare)
+
+            NavigationStack {
+                TestingView(radar: radar) {
+                    statusCard
+                    radarCard
+                }
+            }
+            .tabItem {
+                Label("Testing", systemImage: "record.circle")
+            }
+            .tag(AppTab.testing)
+
             NavigationStack {
                 CameraView(radar: radar)
             }
@@ -73,6 +115,13 @@ struct ContentView: View {
                 Label("Camera", systemImage: "camera.viewfinder")
             }
             .tag(AppTab.camera)
+        }
+        // The sound tab opened last decides which method warns; Compare, Testing and Camera keep it, and so does
+        // switching tabs during a test or evaluation session (its results must come from one method).
+        .onChange(of: selectedTab) {
+            guard EvalStore.shared.active == nil else { return }
+            if selectedTab == .soundRadar { radar.method = .soundRadar }
+            if selectedTab == .audioLab { radar.method = .audioLab }
         }
         .onChange(of: offset, initial: true) { radar.setCalibration(offset: offset, mirror: mirror) }
         .onChange(of: mirror) { radar.setCalibration(offset: offset, mirror: mirror) }
@@ -97,33 +146,11 @@ struct ContentView: View {
                 ("pause.circle.fill", .secondary, "Paused", "Not listening. Resume below or from the Dynamic Island.")
             } else if let trouble = radar.micTrouble {
                 ("mic.slash.fill", .orange, "Not hearing anything", trouble)
-            } else if radar.recognitionDown && radar.alert == nil {
-                ("waveform.slash", .yellow, "Can't recognize sounds", "Sirens and horns aren't being recognized right now. Directions still work; restarting…")
-            } else if let a = radar.alert {
-                (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", a.level.color,
-                 a.level == .critical ? "Watch out!" : "Heads up", "\(a.what) \(directionWords(a.azimuth))")
             } else {
-                switch radar.kind {
-                case .traffic: ("car.fill", .orange, "Traffic nearby", "Normal traffic, mostly \(directionWords(radar.loudestAzimuth(of: .traffic)))")
-                case .people: ("person.2.fill", .blue, "People talking", "Mostly \(directionWords(radar.loudestAzimuth(of: .people)))")
-                default: ("checkmark.circle.fill", .green, "All clear", "Nothing to watch out for")
-                }
+                listeningStatus(alert: radar.alert, kind: radar.kind, recognitionDown: radar.recognitionDown,
+                                traffic: radar.loudestAzimuth(of: .traffic), people: radar.loudestAzimuth(of: .people))
             }
-        return HStack(spacing: 16) {
-            Image(systemName: icon)
-                .font(.system(size: 52, weight: .bold))
-                .foregroundStyle(tint)
-                .rotationEffect(.degrees(-(radar.alert?.azimuth ?? 0)))  // arrow points at the danger
-                .frame(width: 64)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.largeTitle.bold()).foregroundStyle(radar.alert == nil ? .primary : tint)
-                Text(detail).font(.title3)
-            }
-            Spacer(minLength: 0)
-        }
-        .padding(20)
-        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))
-        .accessibilityElement(children: .combine)
+        return StatusCard(icon: icon, tint: tint, title: title, detail: detail, alert: radar.alert)
     }
 
     /// Start a session; then Pause / Resume, or Stop (mic off, Dynamic Island gone).
@@ -152,9 +179,80 @@ struct ContentView: View {
         .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))  // red Stop stays visible on a red alert
     }
 
+    /// What the Audio Lab method hears, and why it gives a direction right now or not.
+    private var labCard: some View {
+        let lab = radar.detector.lab
+        let direction = lab.latest.map { w in
+            w.azimuth.map { String(format: "%.0f° · coherence %.2f", $0, w.coherence) } ?? "none: \(w.rejection ?? "")"
+        } ?? "–"
+        return VStack(alignment: .leading, spacing: 6) {
+            LabeledContent("Hears", value: lab.top.isEmpty ? "–"
+                           : lab.top.prefix(3).map { "\(pretty($0.id)) \(Int($0.confidence * 100))%" }.joined(separator: ", "))
+            LabeledContent("Direction", value: direction)
+            Text("""
+                The prototype's method: one direction per 0.1 s from all frequencies (only when louder than −60 dBFS and \
+                coherent ≥ 0.3), Apple's classifier on the all-around mic, a warning for any alert sound ≥ 30%. Vibration and \
+                the Dynamic Island use it from now until you open the Sound Radar tab. The Compare tab shows both at once.
+                """)
+                .font(.caption).foregroundStyle(.secondary)
+        }
+        .font(.subheadline)
+        .padding()
+        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))
+    }
+
     // MARK: Radar: you in the middle, ahead is up
 
-    private var radarCard: some View {
+    private var radarCard: some View { RadarCard(bins: radar.bins, alert: radar.alert) }
+}
+
+/// The status card while listening (live, or replayed from a test): the warning, else what kind of sound is around.
+func listeningStatus(alert: Alert?, kind: SoundKind, recognitionDown: Bool, traffic: Double?, people: Double?)
+    -> (String, Color, String, String) {
+    if recognitionDown && alert == nil {
+        return ("waveform.slash", .yellow, "Can't recognize sounds", "Sirens and horns aren't being recognized right now. Directions still work; restarting…")
+    }
+    if let a = alert {
+        return (a.azimuth == nil ? "exclamationmark.triangle.fill" : "arrow.up.circle.fill", a.level.color,
+                a.level == .critical ? "Watch out!" : "Heads up", "\(a.what) \(directionWords(a.azimuth))")
+    }
+    switch kind {
+    case .traffic: return ("car.fill", .orange, "Traffic nearby", "Normal traffic, mostly \(directionWords(traffic))")
+    case .people: return ("person.2.fill", .blue, "People talking", "Mostly \(directionWords(people))")
+    default: return ("checkmark.circle.fill", .green, "All clear", "Nothing to watch out for")
+    }
+}
+
+/// One glance tells you what's happening: an arrow at the danger, a title and a line of detail.
+struct StatusCard: View {
+    let icon: String, tint: Color, title: String, detail: String
+    let alert: Alert?
+
+    var body: some View {
+        HStack(spacing: 16) {
+            Image(systemName: icon)
+                .font(.system(size: 52, weight: .bold))
+                .foregroundStyle(tint)
+                .rotationEffect(.degrees(-(alert?.azimuth ?? 0)))  // arrow points at the danger
+                .frame(width: 64)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.largeTitle.bold()).foregroundStyle(alert == nil ? .primary : tint)
+                Text(detail).font(.title3)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(20)
+        .background(Color(.secondarySystemGroupedBackground), in: .rect(cornerRadius: 24))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// You in the middle, ahead is up: a line per sound direction (coloured by kind), a wedge where the warning points.
+struct RadarCard: View {
+    let bins: [Bin]
+    let alert: Alert?
+
+    var body: some View {
         VStack(spacing: 12) {
             ZStack {
                 Canvas { ctx, size in
@@ -169,15 +267,15 @@ struct ContentView: View {
                         ctx.stroke(Path(ellipseIn: CGRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r)),
                                    with: .color(.secondary.opacity(0.35)), lineWidth: 1.5)
                     }
-                    if let alert = radar.alert, let az = alert.azimuth {
+                    if let alert, let az = alert.azimuth {
                         let a = az, arc = Array(stride(from: -25.0, through: 25, by: 5))
                         var wedge = Path()
                         wedge.addLines(arc.map { point(a + $0, r1) } + arc.reversed().map { point(a + $0, r0) })
                         wedge.closeSubpath()
                         ctx.fill(wedge, with: .color(alert.level.color.opacity(0.3)))
                     }
-                    for (i, bin) in radar.bins.enumerated() where bin.strength > 0.01 {
-                        let a = Double(i) / Double(radar.bins.count) * 360
+                    for (i, bin) in bins.enumerated() where bin.strength > 0.01 {
+                        let a = Double(i) / Double(bins.count) * 360
                         var p = Path()
                         p.move(to: point(a, r0 + 6))
                         p.addLine(to: point(a, r0 + 6 + (r1 - r0) * bin.strength))
@@ -214,6 +312,8 @@ struct ContentView: View {
 
 #Playground {
     selfCheck()
+    audioLabSelfCheck()
+    screenFrameSelfCheck()
     hapticsSelfCheck()
     radarActivitySelfCheck()
     vehicleTrackerSelfCheck()

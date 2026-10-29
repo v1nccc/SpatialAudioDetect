@@ -47,10 +47,10 @@ nonisolated struct Reading: Sendable {
         return 10 * log10(max(0.25 * (ww + 2 * side.sign * i + v), 1e-12))
     }
 
-    /// Power a supercardioid beam aimed along `u` (phone frame, unit length) picks up:
+    /// Power a supercardioid beam (or `shape` 0.5: cardioid) aimed along `u` (phone frame, unit length) picks up:
     /// full from that direction, about −9 dB from the sides, −12 dB from behind it.
-    func beamPower(toward u: SIMD3<Double>) -> Double {
-        let a = beamShape, x = simd_dot(u, foaFront), y = simd_dot(u, foaLeft), z = simd_dot(u, foaUp)
+    func beamPower(toward u: SIMD3<Double>, shape: Double = beamShape) -> Double {
+        let a = shape, x = simd_dot(u, foaFront), y = simd_dot(u, foaLeft), z = simd_dot(u, foaUp)
         let along = x * wx + y * wy + z * wz
         let spread = x * x * xx + y * y * yy + z * z * zz + 2 * (x * y * xy + x * z * xz + y * z * yz)
         return max((1 - a) * (1 - a) * ww + 2 * a * (1 - a) * along + a * a * spread, 0)
@@ -358,7 +358,7 @@ nonisolated func slot(_ degrees: Double, of count: Int) -> Int {
     (Int((degrees / 360 * Double(count)).rounded()) % count + count) % count
 }
 
-nonisolated enum AlertLevel: Int, Comparable, Sendable {
+nonisolated enum AlertLevel: Int, Comparable, Codable, Sendable {
     case warning   // orange: worth knowing (horn ahead, bike bell, dog, shout, something getting closer, your name)
     case critical  // red: act now (siren, horn from behind or the side, anything near, your danger words)
     static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
@@ -562,6 +562,8 @@ nonisolated struct Block: Sendable {
     var format: String    // what iOS actually delivers, for the debug screen
     var savingAudio: Bool // the raw audio of this block went into the recording
     var bins: [SIMD4<Float>] = []  // per-frequency intensity (phone frame) and power (binIntensities)
+    var raw = Reading()            // the same block without the high-pass (Audio Lab's method)
+    var clipped = false            // a sample at full scale
 }
 
 /// Turns one delivered buffer into a Block on the shared stream clock. Used by the live tap and the replay tool.
@@ -589,7 +591,9 @@ nonisolated struct BlockMaker {
         let block = Block(reading: foaReading(w: ch[0], y: ch[1], z: ch[2], x: ch[3]),
                           start: Double(frames) / sr, duration: Double(buf.frameLength) / sr,
                           format: "\(Int(sr)) Hz · \(format.channelCount) ch · \(layout) · \(kind)\(format.isInterleaved ? " interleaved" : "") · \(buf.frameLength) frames",
-                          savingAudio: savingAudio, bins: binIntensities(ch, sampleRate: sr, spectrum: spectrum))
+                          savingAudio: savingAudio, bins: binIntensities(ch, sampleRate: sr, spectrum: spectrum),
+                          raw: foaReading(w: raw[0], y: raw[1], z: raw[2], x: raw[3]),
+                          clipped: raw.contains { vDSP.maximumMagnitude($0) >= 0.999 })
         let at = frames
         frames += AVAudioFramePosition(buf.frameLength)
         return (block, raw[0], steering.map { beamSignal(raw, $0) }, at)
@@ -692,7 +696,7 @@ nonisolated struct Processed: Sendable {
 
 nonisolated struct Bin: Sendable { var strength = 0.0, kind = SoundKind.other }
 
-nonisolated struct Alert: Equatable, Sendable {
+nonisolated struct Alert: Equatable, Codable, Sendable {
     var azimuth: Double?  // nil = heard it but direction unclear
     var what: String      // "Car horn", "Vehicle getting closer", "Someone called “Vincent”"
     var level: AlertLevel
@@ -733,6 +737,8 @@ nonisolated struct DebugSnapshot: Sendable {
     var events: [String]
     var alert: Alert?
     var kind: SoundKind
+    var bins: [Bin]
+    var lab: AudioLab  // the Audio Lab prototype's method, on the same audio
 }
 
 /// Decides what to show and when to warn, from audio blocks and classifier verdicts.
@@ -763,6 +769,7 @@ nonisolated struct Detector {
     private(set) var alert: Alert?
     private(set) var alertPulse = 0  // bumps to re-fire the haptic while danger lasts
     private(set) var clock = 0.0     // stream seconds, end of the latest block
+    private(set) var lab = AudioLab()  // the Audio Lab prototype's method, run alongside on the same audio
     private(set) var pendingLog: [String] = []  // new log lines not yet written to a recording
     private var events: [String] = []           // decisions log, newest first
     private var heard: Heard?
@@ -800,7 +807,7 @@ nonisolated struct Detector {
                                  heardLatency: heardLatency, lastJudged: lastJudged,
                                  histogram: sourceHistogram(recent, from: clock - 0.5, to: clock + 1),
                                  trails: scoreTrails.filter { ($0.value.max() ?? 0) >= 0.1 },
-                                 events: events, alert: alert, kind: kind) }
+                                 events: events, alert: alert, kind: kind, bins: bins, lab: lab) }
     }
 
     mutating func clearPendingLog() { pendingLog = [] }
@@ -809,6 +816,7 @@ nonisolated struct Detector {
     mutating func clearAlert() {
         alert = nil
         for i in bins.indices { bins[i].strength = 0 }
+        lab.clearAlert()
     }
 
     mutating func log(_ message: String) {
@@ -821,6 +829,7 @@ nonisolated struct Detector {
     /// One classifier answer: from the all-around mic (h.beam == nil) or one of the 4 beams. The 5 answers for the
     /// same half second are judged together, as soon as all are in (or a newer window overtakes a straggler).
     mutating func hear(_ h: Heard) {
+        lab.hear(h)
         if h.beam == nil {
             heard = h
             heardLatency = clock - h.end
@@ -924,6 +933,7 @@ nonisolated struct Detector {
     mutating func add(_ b: Block, motion m: Motion) -> Processed {
         let r = b.reading
         clock = b.start + b.duration
+        lab.add(b, motion: m, offset: offset, mirror: mirror)
         mics = zip(mics, phoneSides.map(r.micDB)).map { 0.8 * $0 + 0.2 * $1 }
         if clock > alertUntil, alert != nil { alert = nil; log("alert cleared") }
         for i in bins.indices { bins[i].strength *= 0.95 }

@@ -23,6 +23,7 @@ import UIKit
     var active: EvalSession? { activeID.flatMap { id in sessions.first { $0.id == id } } }
     private var activeIndex: Int? { activeID.flatMap { id in sessions.firstIndex { $0.id == id } } }
     private var battery: Double? { UIDevice.current.batteryLevel >= 0 ? Double(UIDevice.current.batteryLevel) : nil }
+    private var charging: Bool { [.charging, .full].contains(UIDevice.current.batteryState) }
 
     func save() {
         try? FileManager.default.createDirectory(at: Self.folder, withIntermediateDirectories: true)
@@ -30,10 +31,13 @@ import UIKit
         lastSave = .now
     }
 
-    func start(_ kind: EvalKind, _ conditions: EvalConditions) {
+    /// `recording`: the folder (Documents/Recordings/…) a test session's audio and logs are saved to.
+    func start(_ kind: EvalKind, _ conditions: EvalConditions, recording: String? = nil) {
         UIDevice.current.isBatteryMonitoringEnabled = true
         var s = EvalSession(kind: kind, started: .now, conditions: conditions)
+        s.recording = recording
         s.reliability.batteryStart = battery
+        s.reliability.charging = charging
         sessions.insert(s, at: 0)
         activeID = s.id
         save()
@@ -43,6 +47,7 @@ import UIKit
         guard let i = activeIndex else { return }
         sessions[i].ended = .now
         sessions[i].reliability.batteryEnd = battery
+        sessions[i].reliability.charging = sessions[i].reliability.charging == true || charging
         activeID = nil
         open = nil
         save()
@@ -54,16 +59,19 @@ import UIKit
         save()
     }
 
+    /// The session and its recording, if it has one.
     func delete(_ id: UUID) {
         if activeID == id { activeID = nil }
+        if let folder = sessions.first(where: { $0.id == id })?.recordingFolder { try? FileManager.default.removeItem(at: folder) }
         sessions.removeAll { $0.id == id }
         save()
     }
 
     // MARK: Fed by SoundRadar while a session runs
 
-    /// Every block: record each new alert, and where it pointed ~1 s later (it follows its sound).
-    func observe(_ alert: Alert?) {
+    /// Every block: record each new alert, and where it pointed ~1 s later (it follows its sound). `audioAt`: seconds
+    /// into the session's recording, if one is running.
+    func observe(_ alert: Alert?, audioAt: Double? = nil) {
         guard let i = activeIndex else { return }
         guard let a = alert else { open = nil; return }
         if let o = open, let j = sessions[i].alerts.firstIndex(where: { $0.id == o.id }),
@@ -74,7 +82,8 @@ import UIKit
             }
             return
         }
-        let record = EvalAlert(at: .now, what: a.what, critical: a.level == .critical, azimuth: a.azimuth, appState: appState())
+        var record = EvalAlert(at: .now, what: a.what, critical: a.level == .critical, azimuth: a.azimuth, appState: appState())
+        record.audioAt = audioAt
         sessions[i].alerts.append(record)
         open = (record.id, .now)
         save()
@@ -122,6 +131,17 @@ import UIKit
         }
         return urls
     }
+}
+
+/// What the app knows itself: sound model and method, fine-tune, iPhone model, iOS version.
+func automaticConditions(_ conditions: EvalConditions, radar: SoundRadar) -> EvalConditions {
+    var c = conditions
+    let d = UserDefaults.standard
+    c.model = "\(radar.engine.rawValue) · \(radar.method.rawValue)"
+    c.fineTune = "rotate \(Int(d.double(forKey: "rotate")))°\(d.bool(forKey: "mirror") ? ", mirrored" : "")"
+    c.device = machineName()
+    c.system = "iOS " + UIDevice.current.systemVersion
+    return c
 }
 
 /// "iPhone17,1"
@@ -180,13 +200,7 @@ struct EvaluationView: View {
                     .foregroundStyle(.orange)
             }
             Button {
-                var c = conditions
-                let d = UserDefaults.standard
-                c.model = radar.engine.rawValue
-                c.fineTune = "rotate \(Int(d.double(forKey: "rotate")))°\(d.bool(forKey: "mirror") ? ", mirrored" : "")"
-                c.device = machineName()
-                c.system = "iOS " + UIDevice.current.systemVersion
-                store.start(kind, c)
+                store.start(kind, automaticConditions(conditions, radar: radar))
                 if !radar.listeningStarted { Task { await radar.start() } } else if radar.paused { radar.setPaused(false) }
             } label: {
                 Label("Start \(kind.rawValue.lowercased())", systemImage: "play.fill").frame(maxWidth: .infinity)
@@ -552,7 +566,7 @@ private struct SessionDetail: View {
         } header: {
             Text("Real events (\(s.marks.count))")
         } footer: {
-            Text("Events marked during the run, plus any you remember afterwards: green = the app alerted within 8 s, red = missed.")
+            Text("Events marked during the run, plus any you remember afterwards: green = the app warned about that sound within 8 s, red = missed.")
         }
     }
 }

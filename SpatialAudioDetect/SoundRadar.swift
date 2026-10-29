@@ -53,13 +53,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     }
     var onBlock: (@Sendable (Block) -> Void)?
     private var maker = BlockMaker()  // one clock shared by direction and classifier
-    private var recordURL: URL?
-    private var file: AVAudioFile?
+    private var recordURL: URL?, listenURL: URL?
+    private var file: AVAudioFile?, listenFile: AVAudioFile?
 
-    /// Start (url) or stop (nil) saving the raw 4-channel audio. Call on the capture queue.
-    func record(to url: URL?) {
+    /// Start or stop (nil) saving the raw 4-channel audio (`url`) and the all-around channel as AAC to listen back to
+    /// (`listen`). Call on the capture queue.
+    func record(to url: URL?, listen: URL? = nil) {
         recordURL = url
-        file = nil  // releasing the file finalizes it
+        listenURL = listen
+        file = nil  // releasing a file finalizes it
+        listenFile = nil
     }
 
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
@@ -72,7 +75,16 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
                                         commonFormat: format.commonFormat, interleaved: format.isInterleaved)
             }
             let saved = (try? file?.write(from: buf)) != nil
-            let made = maker.make(buf, savingAudio: saved, steering: steerLock.withLock { steering })
+            var made = maker.make(buf, savingAudio: saved, steering: steerLock.withLock { steering })
+            if let listenURL, listenFile == nil {
+                listenFile = try? AVAudioFile(forWriting: listenURL, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: format.sampleRate,
+                                                                              AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 64_000])
+            }
+            if let listenFile, let mono = AVAudioPCMBuffer(pcmFormat: listenFile.processingFormat, frameCapacity: AVAudioFrameCount(made.omni.count)) {
+                mono.frameLength = mono.frameCapacity
+                made.omni.withUnsafeBufferPointer { mono.floatChannelData![0].update(from: $0.baseAddress!, count: $0.count) }
+                if (try? listenFile.write(from: mono)) != nil { made.block.savingAudio = true }  // in the recording's audio
+            }
             onBlock?(made.block)
             let listeners = listeners
             listeners[0].feed(made.omni, sampleRate: format.sampleRate, at: made.at)
@@ -109,13 +121,21 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     private(set) var paused = false              // you paused it (screen, Dynamic Island or Lock Screen)
     private(set) var listeningStarted = false
 
-    // What the main screen reads
-    var bins: [Bin] { detector.bins }
-    var kind: SoundKind { detector.kind }
+    /// Which method drives the main screen and the warnings (vibration, Dynamic Island): the Sound Radar or Audio Lab
+    /// tab, whichever was opened last. Both always run, for the Compare tab.
+    var method = DetectionMethod.soundRadar {
+        didSet { if method != oldValue { log("detection method: \(method.rawValue)") } }
+    }
+
+    // What the main screen reads, from the method in use
+    var bins: [Bin] { method == .audioLab ? detector.lab.bins : detector.bins }
+    var kind: SoundKind { method == .audioLab ? detector.lab.kind : detector.kind }
     var label: String { detector.label }
-    var alert: Alert? { detector.alert }
-    var alertPulse: Int { detector.alertPulse }
-    func loudestAzimuth(of kind: SoundKind? = nil) -> Double? { detector.loudestAzimuth(of: kind) }
+    var alert: Alert? { method == .audioLab ? detector.lab.alert : detector.alert }
+    var alertPulse: Int { method == .audioLab ? detector.lab.alertPulse : detector.alertPulse }
+    func loudestAzimuth(of kind: SoundKind? = nil) -> Double? {
+        method == .audioLab ? detector.lab.latest?.azimuth : detector.loudestAzimuth(of: kind)
+    }
 
     /// Which sound model the 5 listeners use (Debug › Sound model), kept across launches.
     var engine = SoundEngine(rawValue: UserDefaults.standard.string(forKey: "soundEngine") ?? "") ?? .apple {
@@ -164,6 +184,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     private let queue = DispatchQueue(label: "foa-capture")
     private let motion = CMMotionManager()
     @ObservationIgnored private var nextDebug = 0.0
+    @ObservationIgnored private var nextFrame = 0.0  // next screen frame for the recording's replay
     @ObservationIgnored private var lastBlockAt: Date?
     @ObservationIgnored private var lastNotified: (what: String, at: Date)?
     @ObservationIgnored private var startRequested = false
@@ -344,24 +365,38 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
         return true
     }
 
+    /// Seconds into the running recording's audio; nil when not recording.
+    var recordingTime: Double? { recorder?.audioTime(detector.clock) }
+
     func toggleRecording() {
-        let tap = tap
-        if let r = recorder {
-            queue.async { tap.record(to: nil) }
-            log("recording stopped: \(r.folder.lastPathComponent)")
-            r.close()
-            recordedFiles = r.files
-            recorder = nil
-        } else {
-            do {
-                let r = try Recorder(startedAt: detector.clock)
-                recorder = r
-                queue.async { tap.record(to: r.audio) }
-                log("recording started: \(r.folder.lastPathComponent)")
-            } catch {
-                log("recording failed: \(error.localizedDescription)")
-            }
+        if recorder == nil { startRecording() } else { stopRecording() }
+    }
+
+    /// Start saving the audio and logs to Documents/Recordings/<date time>/; `raw`: also the 4-channel audio (~46 MB per
+    /// minute) for replaying on a Mac. Returns the folder's name (the running recording's, if one is), nil if it failed.
+    @discardableResult
+    func startRecording(raw: Bool = true) -> String? {
+        if let r = recorder { return r.folder.lastPathComponent }
+        do {
+            let r = try Recorder(startedAt: detector.clock), tap = tap
+            recorder = r
+            queue.async { tap.record(to: raw ? r.audio : nil, listen: r.listen) }
+            log("recording started: \(r.folder.lastPathComponent)\(raw ? "" : " (no 4-channel audio)")")
+            return r.folder.lastPathComponent
+        } catch {
+            log("recording failed: \(error.localizedDescription)")
+            return nil
         }
+    }
+
+    func stopRecording() {
+        guard let r = recorder else { return }
+        let tap = tap
+        queue.async { tap.record(to: nil) }
+        log("recording stopped: \(r.folder.lastPathComponent)")
+        r.close()
+        recordedFiles = r.files
+        recorder = nil
     }
 
     private func add(_ b: Block) {
@@ -374,13 +409,19 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
             probe?.append(b.reading)
             if let room = probeRoom { probeRise = max(probeRise ?? -.infinity, b.reading.db - room) }
         }
-        let pulse = detector.alertPulse
+        let pulse = alertPulse
         let p = detector.add(b, motion: m)
-        EvalStore.shared.observe(detector.alert)  // evaluation session: record every alert and where it pointed
+        EvalStore.shared.observe(alert, audioAt: recordingTime)  // evaluation session: record every alert and where it pointed
         tap.steer(detector.beamWeights)
         blocksThisSecond += 1
         react(since: pulse)
-        recorder?.block(p, kind: detector.kind, alert: detector.alert)
+        recorder?.block(p, kind: kind, alert: alert)
+        // What the screen shows, 10 times a second, so a test can be replayed as it looked.
+        if let r = recorder, detector.clock >= nextFrame, let t = r.audioTime(detector.clock) {
+            nextFrame = detector.clock + 0.1
+            r.screen(ScreenFrame(t: t, alert: alert, kind: kind, bins: bins, traffic: loudestAzimuth(of: .traffic),
+                                 people: loudestAzimuth(of: .people), recognitionDown: recognitionDown))
+        }
         flushLog()
         if detector.clock >= nextDebug {
             nextDebug = detector.clock + 0.1
@@ -396,17 +437,17 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     }
 
     private func heardWords(_ phrase: String, isName: Bool, from start: Double, to end: Double) {
-        let pulse = detector.alertPulse
+        let pulse = alertPulse
         detector.heardWords(phrase, isName: isName, from: start, to: end)
         react(since: pulse)
         flushLog()
     }
 
     private func hear(_ h: Heard) {
-        let pulse = detector.alertPulse
+        let pulse = alertPulse
         verdictsThisSecond += 1
         detector.hear(h)
-        EvalStore.shared.observe(detector.alert)
+        EvalStore.shared.observe(alert, audioAt: recordingTime)
         react(since: pulse)
         recorder?.verdict(h, received: detector.clock)
         flushLog()
@@ -415,7 +456,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     /// Feel the warning: the user's pattern for this kind of alert (from here, not a SwiftUI view, so it also
     /// runs while the app is in the background), plus a notification when the app isn't on screen.
     private func react(since pulse: Int) {
-        guard detector.alertPulse != pulse, let a = detector.alert else { return }
+        guard alertPulse != pulse, let a = alert else { return }
         refreshActivity()  // straight away, not at the next 1 s tick: this is what pops the island open
         let s = HapticSettings.load(), haptics = haptics
         let body = a.what + " " + directionWords(a.azimuth)
@@ -556,7 +597,7 @@ nonisolated final class FOATap: NSObject, AVCaptureAudioDataOutputSampleBufferDe
     // MARK: Dynamic Island / Lock Screen
 
     private func liveState() -> RadarActivity.ContentState {
-        if let a = detector.alert {
+        if let a = alert {
             held = (a, nil)
         } else if let h = held, h.endedAt == nil {
             held = (h.alert, .now)

@@ -57,7 +57,14 @@ nonisolated struct EvalTrial: Codable, Identifiable, Sendable {
 
 /// Every alert the app raised during a session, recorded automatically.
 nonisolated struct EvalAlert: Codable, Identifiable, Sendable {
-    nonisolated enum Review: String, Codable, CaseIterable, Sendable { case real = "Real", falseAlarm = "False alarm", unsure = "Not sure" }
+    /// The sound: right, a real sound under the wrong name (a siren called a horn), nothing worth an alert, or not sure.
+    nonisolated enum Review: String, Codable, CaseIterable, Sendable {
+        case real = "Real", wrongSound = "Wrong sound", falseAlarm = "False alarm", unsure = "Not sure"
+    }
+    /// The arrow: pointed at it, the right side but off, or a different side.
+    nonisolated enum DirectionReview: String, Codable, CaseIterable, Sendable { case right = "Right", close = "Close", wrong = "Wrong" }
+    /// While the sound was still on and early enough to react, or only after it mattered.
+    nonisolated enum TimingReview: String, Codable, CaseIterable, Sendable { case onTime = "On time", late = "Late" }
     var id = UUID()
     var at: Date
     var what: String
@@ -67,8 +74,15 @@ nonisolated struct EvalAlert: Codable, Identifiable, Sendable {
     var appState: String
     var haptic: String?           // what iOS answered for its first vibration
     var hapticOK: Bool?
-    var review: Review?           // real runs: was it a real danger?
+    var review: Review?           // real runs: was it a real danger, and the right sound?
+    var directionReview: DirectionReview?  // real runs: was the arrow right (not asked for false alarms)
+    var timingReview: TimingReview?        // real runs: did it come in time
+    var audioAt: Double?          // test sessions: seconds into the recording's audio (exact even after a pause)
+    var directionOffBy: Double?   // where the sound really was: degrees clockwise from the arrow (− = counter-clockwise)
+    var lateBy: Double?           // how late it came, seconds
     var direction: Double? { settledAzimuth ?? azimuth }
+    /// Where the sound really was (clockwise = toward the right = smaller azimuth), once you've said how far off it was.
+    var trueAzimuth: Double? { zip2(direction, directionOffBy).map { remainder($0 - $1, 360) } }
 }
 
 /// A real-run event someone noticed (siren, horn…), to check the app caught it.
@@ -77,6 +91,8 @@ nonisolated struct EvalMark: Codable, Identifiable, Sendable {
     var at: Date
     var sound: String
     var note = ""
+    var audioAt: Double?  // test sessions: seconds into the recording's audio
+    var inReplay: Bool?   // flagged afterwards while replaying the test, not live
 }
 
 nonisolated struct EvalReliability: Codable, Sendable {
@@ -84,6 +100,7 @@ nonisolated struct EvalReliability: Codable, Sendable {
     var restarts = 0
     var batteryStart: Double?, batteryEnd: Double?                // 0…1
     var hottest = "normal"
+    var charging: Bool?  // on the charger at the start or end: its battery use doesn't count
 }
 
 nonisolated struct EvalSession: Codable, Identifiable, Sendable {
@@ -96,7 +113,9 @@ nonisolated struct EvalSession: Codable, Identifiable, Sendable {
     var marks: [EvalMark] = []
     var alerts: [EvalAlert] = []
     var reliability = EvalReliability()
+    var recording: String?  // test sessions (Testing tab): their audio and logs, Documents/Recordings/<this>
     var played: [EvalTrial] { trials.filter { $0.at != nil } }
+    var recordingFolder: URL? { recording.map { URL.documentsDirectory.appending(path: "Recordings/\($0)") } }
 }
 
 /// Alerts from 1 s before a trial's mark (tapped a bit late) to 8 s after (the classifier needs ~1–2 s to confirm).
@@ -125,10 +144,21 @@ nonisolated func result(_ t: EvalTrial, alerts: [EvalAlert]) -> TrialResult? {
                        reaction: t.noticedAt.map { $0.timeIntervalSince(at) })
 }
 
-/// A real-run mark counts as caught if an alert came within 8 s either side of it.
-nonisolated func caught(_ m: EvalMark, alerts: [EvalAlert]) -> Bool {
-    alerts.contains { abs($0.at.timeIntervalSince(m.at)) <= 8 }
+/// Within 8 s either side: by the recording's time when both have one (exact across pauses, and the only time a flag
+/// made in a replay has), else by the clock.
+nonisolated func near(_ a: EvalAlert, _ m: EvalMark) -> Bool {
+    if let x = a.audioAt, let y = m.audioAt { return abs(x - y) <= 8 }
+    return abs(a.at.timeIntervalSince(m.at)) <= 8
 }
+
+/// The warning that caught a danger someone flagged: near it and for that sound. "Other danger" takes any warning, and so
+/// does a warning you marked the wrong sound (it noticed this danger under another name). A coincidental warning for a
+/// different sound doesn't count: the runner wasn't warned about this one.
+nonisolated func catcher(_ m: EvalMark, alerts: [EvalAlert]) -> EvalAlert? {
+    alerts.first { near($0, m) && (m.sound == "Other danger" || alertMatches(m.sound, $0.what) || $0.review == .wrongSound) }
+}
+
+nonisolated func caught(_ m: EvalMark, alerts: [EvalAlert]) -> Bool { catcher(m, alerts: alerts) != nil }
 
 // MARK: Metrics
 
@@ -219,8 +249,24 @@ nonisolated func evalMetrics(_ sessions: [EvalSession]) -> [EvalMetric] {
     let runs = sessions.filter { $0.kind == .realRun }
     let reviewed = runs.flatMap(\.alerts).compactMap(\.review).filter { $0 != .unsure }
     let g4 = "Real runs"
-    share(g4, "Alerts that were real", reviewed.filter { $0 == .real }.count, reviewed.count, atLeast: 0.8,
+    let real = reviewed.filter { $0 != .falseAlarm }
+    share(g4, "Alerts that were real", real.count, reviewed.count, atLeast: 0.8,
           "Of the alerts you reviewed after the run, how many were a real danger (precision).")
+    share(g4, "Real alerts named right", real.filter { $0 == .real }.count, real.count, atLeast: 0.9,
+          "Of the real ones: the alert said the right sound.")
+    let realAlerts = runs.flatMap(\.alerts).filter { $0.review != .falseAlarm }
+    let aimedReal = realAlerts.compactMap(\.directionReview)
+    share(g4, "Real alerts pointing right", aimedReal.filter { $0 == .right }.count, aimedReal.count, atLeast: 0.85,
+          "Of the real ones you judged: the arrow pointed at the sound (\"close\" doesn't count).")
+    let timed = realAlerts.compactMap(\.timingReview)
+    share(g4, "Real alerts on time", timed.filter { $0 == .onTime }.count, timed.count, atLeast: 0.9,
+          "Of the real ones you judged: it came while the sound was on, early enough to react.")
+    var judged = VerdictCount()
+    runs.flatMap(\.alerts).forEach { judged.add($0) }
+    number(g4, "Real alerts: angle off (median)", percentile(judged.angleErrors, 0.5), unit: "°", digits: 0, atMost: 30,
+           n: judged.angleErrors.count, "0° when it pointed right, else how far off you set it.")
+    number(g4, "Real alerts: late by (median)", percentile(judged.lateBys, 0.5).map { $0 * 1000 }, unit: "ms", digits: 0, atMost: 500,
+           n: judged.lateBys.count, "0 when on time, else how late you set it.")
     let falseCount = reviewed.filter { $0 == .falseAlarm }.count, minutes = runs.map(\.reliability.listening).reduce(0, +) / 60
     out.append(EvalMetric(group: g4, name: "False alarms per 10 min",
                           value: minutes > 0 ? String(format: "%.1f (%d in %.0f min)", Double(falseCount) / minutes * 10, falseCount, minutes) : "no data",
@@ -243,7 +289,8 @@ nonisolated func evalMetrics(_ sessions: [EvalSession]) -> [EvalMetric] {
     number(g5, "Classifier restarts per hour", hours > 0 ? Double(rel.map(\.restarts).reduce(0, +)) / hours : nil, unit: "/h",
            atMost: 2, n: rel.map(\.restarts).reduce(0, +), "Times recognition failed and restarted itself.")
     let drains = sessions.compactMap { s -> (Double, Double)? in
-        guard let a = s.reliability.batteryStart, let b = s.reliability.batteryEnd, s.reliability.listening > 300 else { return nil }
+        guard let a = s.reliability.batteryStart, let b = s.reliability.batteryEnd, s.reliability.listening > 300,
+              s.reliability.charging != true else { return nil }
         return (a - b, s.reliability.listening / 3600)
     }
     let drain = drains.isEmpty ? nil : drains.map(\.0).reduce(0, +) / drains.map(\.1).reduce(0, +) * 100
@@ -302,6 +349,158 @@ nonisolated func evalCSVs(_ sessions: [EvalSession]) -> [String: String] {
             "sessions.csv": csv(sessionsRows)]
 }
 
+// MARK: Test sessions (Testing tab)
+
+/// Each alert's three verdicts counted: the sound (right / wrong name / false alarm), and for the real ones the
+/// direction (right / close / wrong) and the timing (on time / late). Not-sure or not-yet-marked counts apart.
+nonisolated struct VerdictCount: Sendable {
+    var right = 0, wrongSound = 0, falseAlarms = 0, unsure = 0, unmarked = 0
+    var pointedRight = 0, pointedClose = 0, pointedWrong = 0
+    var onTime = 0, late = 0
+    var angleErrors: [Double] = []  // degrees off: 0 when it pointed right, else what you set (unset ones left out)
+    var lateBys: [Double] = []      // seconds late: 0 when on time, else what you set
+    var real: Int { right + wrongSound }
+    var aimed: Int { pointedRight + pointedClose + pointedWrong }
+    var timed: Int { onTime + late }
+
+    mutating func add(_ a: EvalAlert) {
+        switch a.review {
+        case .real?: right += 1
+        case .wrongSound?: wrongSound += 1
+        case .falseAlarm?: falseAlarms += 1
+        case .unsure?: unsure += 1
+        case nil: unmarked += 1
+        }
+        guard a.review != .falseAlarm else { return }  // nothing there: no direction or timing to judge
+        switch a.directionReview {
+        case .right?: pointedRight += 1; angleErrors.append(0)
+        case .close?: pointedClose += 1; if let d = a.directionOffBy { angleErrors.append(abs(d)) }
+        case .wrong?: pointedWrong += 1; if let d = a.directionOffBy { angleErrors.append(abs(d)) }
+        case nil: break
+        }
+        switch a.timingReview {
+        case .onTime?: onTime += 1; lateBys.append(0)
+        case .late?: late += 1; if let l = a.lateBy { lateBys.append(l) }
+        case nil: break
+        }
+    }
+
+    /// What's wrong, in words: more than 20% of the judged ones failed on that point.
+    var problems: [String] {
+        func over(_ bad: Int, _ of: Int) -> Bool { of > 0 && Double(bad) > 0.2 * Double(of) }
+        return [(over(falseAlarms, real + falseAlarms), "false alarms"), (over(wrongSound, real), "wrong sound"),
+                (over(pointedWrong, aimed), "direction"), (over(late, timed), "late")].filter(\.0).map(\.1)
+    }
+}
+
+/// One sound's results in a test: its alerts' verdicts, and the real events you flagged.
+nonisolated struct SoundTally: Identifiable, Sendable {
+    var id: String { sound }
+    var sound: String
+    var verdicts = VerdictCount()
+    var caught = 0, missed = 0  // real events you flagged: the app alerted within 8 s or not
+    var problems: [String] { verdicts.problems + (missed > 0 ? ["missed"] : []) }
+    var needsWork: Bool { !problems.isEmpty }
+}
+
+/// Per sound, the ones that need work first. A flagged event counts under the alert name it should have produced.
+nonisolated func soundTallies(_ s: EvalSession) -> [SoundTally] {
+    var t: [String: SoundTally] = [:]
+    for a in s.alerts {
+        var x = t[a.what] ?? SoundTally(sound: a.what)
+        x.verdicts.add(a)
+        t[a.what] = x
+    }
+    for m in s.marks {
+        let key = t.keys.first { alertMatches(m.sound, $0) } ?? m.sound
+        var x = t[key] ?? SoundTally(sound: key)
+        if caught(m, alerts: s.alerts) { x.caught += 1 } else { x.missed += 1 }
+        t[key] = x
+    }
+    func order(_ x: SoundTally) -> (Int, Int, String) { (x.needsWork ? 0 : 1, -s.alerts.filter { $0.what == x.sound }.count, x.sound) }
+    return t.values.sorted { order($0) < order($1) }
+}
+
+/// A test session's headline numbers.
+nonisolated struct TestSummary: Sendable {
+    var minutes = 0.0, verdicts = VerdictCount(), eventsCaught = 0, eventsMissed = 0
+    var falsePer10Minutes: Double?
+    var batteryUsed: Double?      // 0…1, nil on the charger or unknown (simulator)
+    var batteryPerHour: Double?   // only from 5 min on: iOS reports the battery in 5% steps
+
+    init(_ s: EvalSession, now: Date = .now) {
+        minutes = (s.ended ?? now).timeIntervalSince(s.started) / 60
+        s.alerts.forEach { verdicts.add($0) }
+        eventsCaught = s.marks.filter { caught($0, alerts: s.alerts) }.count
+        eventsMissed = s.marks.count - eventsCaught
+        let listening = s.reliability.listening / 60
+        falsePer10Minutes = listening > 0 ? Double(verdicts.falseAlarms) / listening * 10 : nil
+        if let a = s.reliability.batteryStart, let b = s.reliability.batteryEnd, s.reliability.charging != true {
+            batteryUsed = a - b
+            batteryPerHour = minutes >= 5 ? (a - b) / (minutes / 60) : nil
+        }
+    }
+}
+
+/// k of n as a fraction, nil without any.
+nonisolated func fraction(_ k: Int, _ n: Int) -> Double? { n > 0 ? Double(k) / Double(n) : nil }
+
+/// A test session as spreadsheets: timeline.csv (every alert and flagged event by time into the test, with its
+/// direction and your three verdicts), by_sound.csv and summary.csv.
+nonisolated func testCSVs(_ s: EvalSession) -> [String: String] {
+    let iso = ISO8601DateFormatter()
+    iso.timeZone = .current
+    func f(_ x: Double?, _ digits: Int = 0) -> String { x.map { String(format: "%.\(digits)f", $0) } ?? "" }
+    func pct(_ x: Double?) -> String { x.map { "\(Int(($0 * 100).rounded()))%" } ?? "" }
+    let sounds: [EvalAlert.Review: String] = [.real: "right", .wrongSound: "wrong sound", .falseAlarm: "false alarm", .unsure: "not sure"]
+    func row(_ a: EvalAlert) -> [String] {
+        let nothing = a.review == .falseAlarm, off = nothing || a.directionReview == .right, late = !nothing && a.timingReview == .late
+        let vibration: String = a.hapticOK.map { $0 ? "ok" : "failed: \(a.haptic ?? "")" } ?? ""
+        let soundVerdict: String = a.review.flatMap { sounds[$0] } ?? "not marked"
+        let directionVerdict: String = nothing ? "" : a.directionReview?.rawValue.lowercased() ?? "not marked"
+        let timingVerdict: String = nothing ? "" : a.timingReview?.rawValue.lowercased() ?? "not marked"
+        let head: [String] = ["alert", a.what, a.critical ? "critical" : "warning", f(a.azimuth), f(a.settledAzimuth), directionWords(a.direction),
+                              a.appState, vibration]
+        let verdicts: [String] = [soundVerdict, directionVerdict, timingVerdict, off ? "" : f(a.directionOffBy), off ? "" : f(a.trueAzimuth),
+                                  late ? f(a.lateBy.map { $0 * 1000 }) : ""]
+        return head + verdicts
+    }
+    var items: [(at: Date, offset: Double, row: [String])] = s.alerts.map { ($0.at, $0.audioAt ?? $0.at.timeIntervalSince(s.started), row($0)) }
+    for m in s.marks {
+        let row: [String] = ["real event", m.sound, m.inReplay == true ? "flagged in replay" : "flagged live", "", "", "", "", "",
+                             caught(m, alerts: s.alerts) ? "caught" : "missed", "", "", "", "", ""]
+        items.append((m.at, m.audioAt ?? m.at.timeIntervalSince(s.started), row))
+    }
+    let timeline = [["offset_s", "time", "type", "what", "level", "azimuth", "azimuth_1s", "direction", "app_state", "vibration",
+                     "sound_verdict", "direction_verdict", "timing_verdict", "direction_off_cw_deg", "true_azimuth", "late_ms"]]
+        + items.sorted { $0.offset < $1.offset }.map { [f($0.offset, 1), iso.string(from: $0.at)] + $0.row }
+    let bySound = [["sound", "right", "wrong_sound", "false_alarm", "not_sure", "not_marked", "direction_right", "direction_close",
+                    "direction_wrong", "on_time", "late", "events_caught", "events_missed", "median_angle_off", "median_late_ms", "needs_work"]]
+        + soundTallies(s).map { x in
+            let v = x.verdicts
+            return [x.sound] + [v.right, v.wrongSound, v.falseAlarms, v.unsure, v.unmarked, v.pointedRight, v.pointedClose, v.pointedWrong,
+                                v.onTime, v.late, x.caught, x.missed].map(String.init)
+                + [f(percentile(v.angleErrors, 0.5)), f(percentile(v.lateBys, 0.5).map { $0 * 1000 }), x.problems.joined(separator: "; ")]
+        }
+    let t = TestSummary(s), v = t.verdicts, r = s.reliability, c = s.conditions
+    let summary: [[String]] = [["metric", "value"], ["started", iso.string(from: s.started)], ["minutes", f(t.minutes, 1)], ["method", c.model],
+                   ["carried", c.carry], ["activity", c.activity], ["place", c.place], ["notes", c.notes], ["alerts", "\(s.alerts.count)"],
+                   ["not_marked", "\(v.unmarked)"], ["not_sure", "\(v.unsure)"],
+                   ["real_sound", "\(v.real) of \(v.real + v.falseAlarms)"], ["real_share", pct(fraction(v.real, v.real + v.falseAlarms))],
+                   ["named_right", "\(v.right) of \(v.real)"], ["direction_right", "\(v.pointedRight) of \(v.aimed)"],
+                   ["direction_right_or_close", pct(fraction(v.pointedRight + v.pointedClose, v.aimed))],
+                   ["on_time", "\(v.onTime) of \(v.timed)"], ["false_alarms_per_10_min", f(t.falsePer10Minutes, 1)],
+                   ["angle_off_median_deg", f(percentile(v.angleErrors, 0.5))], ["angle_off_worst_deg", f(v.angleErrors.max())],
+                   ["late_median_ms", f(percentile(v.lateBys, 0.5).map { $0 * 1000 })], ["late_worst_ms", f(v.lateBys.max().map { $0 * 1000 })]]
+    let rest: [[String]] = [
+                   ["events_caught", "\(t.eventsCaught)"], ["events_missed", "\(t.eventsMissed)"],
+                   ["battery_start", f(r.batteryStart.map { $0 * 100 })], ["battery_end", f(r.batteryEnd.map { $0 * 100 })],
+                   ["battery_per_hour", f(t.batteryPerHour.map { $0 * 100 }, 1)], ["on_charger", r.charging == true ? "yes" : "no"],
+                   ["hottest", r.hottest], ["recognition_down_s", f(r.recognitionDown)], ["mic_trouble_s", f(r.micTrouble)],
+                   ["classifier_restarts", "\(r.restarts)"], ["device", "\(c.device) · \(c.system)"], ["fine_tune", c.fineTune]]
+    return ["timeline.csv": csv(timeline), "by_sound.csv": csv(bySound), "summary.csv": csv(summary + rest)]
+}
+
 /// Plan for a controlled test: every chosen alert sound from every side `repeats` times, plus harmless sounds, shuffled.
 /// `lockEvery`: 0 = never locked, 2 = every other trial, 1 = all.
 nonisolated func evalPlan(sounds: [String], repeats: Int, quiet: [String], quietCount: Int, meters: Double, lockEvery: Int,
@@ -357,4 +556,59 @@ nonisolated func evaluationSelfCheck() {
     let plan = evalPlan(sounds: ["Siren", "Car horn"], repeats: 3, quiet: ["Talking"], quietCount: 4, meters: 10, lockEvery: 2, using: &rng)
     precondition(plan.count == 28 && plan.filter(\.shouldAlert).count == 24 && plan.filter(\.locked).count == 14, "plan")
     precondition(Side.allCases.allSatisfy { side in plan.filter { $0.sound == "Siren" && $0.side == side }.count == 3 }, "every side 3×")
+
+    // A 30 min test. Horns: 3 right (one pointing wrong, one late) + 1 false alarm; sirens: a real siren named "Siren"
+    // pointing right and on time, and one that was really a horn; a dog not marked yet. Flagged: a horn the app caught,
+    // a siren it missed.
+    func alert(_ s: Double, _ what: String, _ r: EvalAlert.Review?, _ d: EvalAlert.DirectionReview? = nil, _ tm: EvalAlert.TimingReview? = nil,
+               off: Double? = nil, late: Double? = nil) -> EvalAlert {
+        EvalAlert(at: at(s), what: what, critical: true, azimuth: 180, appState: "foreground", review: r, directionReview: d, timingReview: tm,
+                  directionOffBy: off, lateBy: late)
+    }
+    var test = EvalSession(kind: .realRun, started: t0, ended: at(1800), conditions: EvalConditions())
+    // Set by hand: the second horn was really 90° clockwise of the arrow, the fourth 1.2 s late, the misnamed siren 30° off
+    // counter-clockwise; the false alarm's numbers don't count.
+    test.alerts = [alert(0, "Horn", .real, .right, .onTime), alert(100, "Horn", .real, .wrong, .onTime, off: 90),
+                   alert(200, "Horn", .falseAlarm, .wrong, .late, off: 45, late: 3), alert(300, "Horn", .real, .right, .late, late: 1.2),
+                   alert(600, "Siren", .real, .right, .onTime), alert(660, "Siren", .wrongSound, .close, .onTime, off: -30), alert(900, "Dog barking", nil)]
+    test.marks = [EvalMark(at: at(102), sound: "Car horn"), EvalMark(at: at(1500), sound: "Siren")]
+    test.reliability = EvalReliability(listening: 1800, batteryStart: 0.80, batteryEnd: 0.75)
+    let tallies = Dictionary(uniqueKeysWithValues: soundTallies(test).map { ($0.sound, $0) })
+    let horn = tallies["Horn"]!, siren = tallies["Siren"]!
+    precondition(horn.verdicts.right == 3 && horn.verdicts.falseAlarms == 1 && horn.caught == 1, "horns -> \(horn)")
+    precondition(horn.verdicts.aimed == 3 && horn.verdicts.timed == 3, "a false alarm's direction and timing don't count")
+    precondition(horn.problems == ["false alarms", "direction", "late"], "1 of 4 false, 1 of 3 wrong way, 1 of 3 late -> \(horn.problems)")
+    precondition(siren.problems == ["wrong sound", "missed"], "1 of 2 named wrong, a flagged one missed -> \(siren.problems)")
+    precondition(tallies["Dog barking"]!.verdicts.unmarked == 1 && !tallies["Dog barking"]!.needsWork, "dog not marked yet")
+    precondition(soundTallies(test).last?.sound == "Dog barking", "the ones that need work come first")
+    let sum = TestSummary(test), v = sum.verdicts
+    precondition(v.real == 5 && v.falseAlarms == 1 && v.right == 4 && v.unmarked == 1 && v.pointedRight == 3 && v.aimed == 5
+                 && v.onTime == 4 && v.timed == 5 && sum.eventsCaught == 1 && sum.eventsMissed == 1, "summary -> \(sum)")
+    precondition(abs(sum.falsePer10Minutes! - 1.0 / 3) < 1e-9 && abs(sum.batteryPerHour! - 0.1) < 1e-9, "rates -> \(sum)")
+    precondition(v.angleErrors.sorted() == [0, 0, 0, 30, 90] && v.lateBys.sorted() == [0, 0, 0, 0, 1.2], "angles and delays -> \(v)")
+    precondition(test.alerts[1].trueAzimuth == 90 && test.alerts[5].trueAzimuth == -150, "clockwise = toward the right (smaller azimuth)")
+    test.reliability.charging = true
+    precondition(TestSummary(test).batteryUsed == nil, "on the charger: battery use doesn't count")
+    let files = testCSVs(test), lines = files["timeline.csv"]!.split(separator: "\n")
+    precondition(lines.count == 10 && files["by_sound.csv"]!.split(separator: "\n").count == 4,
+                 "timeline: header + 7 alerts + 2 events; by sound: header + 3")
+    precondition(lines[2].hasPrefix("100.0,") && lines[2].hasSuffix("right,wrong,on time,90,90,"), "sorted, verdicts, really 90° -> \(lines[2])")
+    precondition(lines[4].hasSuffix("false alarm,,,,,"), "a false alarm has no direction or timing -> \(lines[4])")
+    precondition(lines[5].hasSuffix(",late,,,1200"), "1.2 s late -> \(lines[5])")
+
+    // A danger flagged while replaying, timed by the recording: caught by an alert at the same recording time even though
+    // the test was paused before it (so the clock times are 100 s apart); missed when the recording times are far apart.
+    var later = EvalAlert(at: at(500), what: "Horn", critical: true, appState: "foreground")
+    later.audioAt = 400
+    precondition(caught(EvalMark(at: at(400), sound: "Car horn", audioAt: 403, inReplay: true), alerts: [later]), "same recording time: caught")
+    precondition(!caught(EvalMark(at: at(500), sound: "Car horn", audioAt: 300, inReplay: true), alerts: [later]), "100 s apart: missed")
+    // A dog flagged 5 s after a horn warning wasn't warned about; it is once the horn is marked the wrong sound (it was the
+    // dog), and an "other danger" takes any warning.
+    let dog = EvalMark(at: at(505), sound: "Dog bark", audioAt: 405, inReplay: true)
+    precondition(!caught(dog, alerts: [later]) && caught(EvalMark(at: at(505), sound: "Other danger", audioAt: 405), alerts: [later]), "another sound")
+    later.review = .wrongSound
+    precondition(caught(dog, alerts: [later]), "marked the wrong sound: it noticed the dog")
+    test.marks.append(EvalMark(at: at(1700), sound: "Siren", audioAt: 950, inReplay: true))
+    let replayLines = testCSVs(test)["timeline.csv"]!.split(separator: "\n")
+    precondition(replayLines[9].hasPrefix("950.0,") && replayLines[9].contains("flagged in replay"), "sorted by recording time -> \(replayLines[9])")
 }
